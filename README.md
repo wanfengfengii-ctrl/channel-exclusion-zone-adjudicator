@@ -23,8 +23,9 @@
 | 分类 | 含义 | 裁决 |
 | --- | --- | --- |
 | `BOUNDARY` | 严格落在任意一条边或顶点上（**含边线与顶点本身**） | `FORBIDDEN` |
-| `INSIDE` | 严格在多边形内部 | `FORBIDDEN` |
-| `NEAR_BOUNDARY` | 严格在外部、但距任一边不超过 `exclusion_margin_cm`（仅设置了正安全距离时出现） | `FORBIDDEN` |
+| `INSIDE` | 严格在多边形内部（含落在许可口袋边界上的点） | `FORBIDDEN` |
+| `NEAR_BOUNDARY` | 严格在外部、但距任一边不超过 `exclusion_margin_cm`；或严格在许可口袋内部、但距口袋边界不超过该值（仅设置了正安全距离时出现） | `FORBIDDEN` |
+| `PERMITTED_POCKET` | 严格位于某个许可口袋内部，且未被安全距离带覆盖（仅提交 `permitted_pockets` 时出现） | `ALLOWED` |
 | `OUTSIDE` | 严格在多边形外部，且未被安全距离覆盖 | `ALLOWED` |
 
 - 点同时命中多条边（即顶点）时，证据中的 `edge_index` 取**输入边序号最小者**。
@@ -45,7 +46,9 @@
   **不超过**该值的点改判 `FORBIDDEN`，分类标记为 `NEAR_BOUNDARY`；刚越过阈值的
   外部点正常放行；
 - 距离计算全程整数：以叉积、点积和平方距离分数比较点到各线段（含端点）的最短
-  距离，不使用浮点；最近距离相同（如顶点两侧邻边）时取**最小边序号**；
+  距离，不使用浮点；最近距离相同（如顶点两侧邻边）时，先比**到边所在直线的垂直
+  距离**（与顶点编号无关的几何量，保证顺/逆时针区域把同一点归因到同一条几何边），
+  仍相同再取**最小边序号**；
 - `NEAR_BOUNDARY` 的证据给出该边及**约分后**的距离平方分子/分母，例如：
 
   ```json
@@ -62,6 +65,37 @@
 
 - 负数、非整数（布尔、数字字符串、`5.0` 这类浮点）或超过坐标上限的安全距离，
   与坐标校验一样**整单返回 422**（`VALIDATION_ERROR`），绝不返回部分结果。
+
+### 许可口袋 `permitted_pockets`（可选）
+
+港调获批在禁抛区内部划定临时许可口袋后，可在请求顶层附带可选字段
+`permitted_pockets`：最多 **10** 个简单多边形，每个口袋的顶点规则与禁抛区
+完全一致（3～200 个不同顶点、允许末尾闭合写法、严格整数坐标、未声明字段拒绝）。
+
+- **几何校验**（任一不满足即整单 422，绝不返回部分结果，错误 `details`
+  携带对应口袋序号或计数）：
+  - 每个口袋**严格位于禁抛区内部**：全部顶点严格在区域内，且任意口袋边与
+    区域边无公共点（接触也不行）；
+  - 口袋两两之间**不接触、不重叠**（含相互嵌套）；
+  - 外环与全部口袋**规整后**的总顶点数不超过 **500**；
+- **裁决仍走原链路**：先按禁抛区分类，再对严格落入某口袋内部的点改判
+  `ALLOWED`，分类 `PERMITTED_POCKET`，证据携带按输入顺序归因的
+  `pocket_index`；点落在口袋边界（含顶点）上仍 `FORBIDDEN`（按禁抛区内部
+  处理，分类与证据维持原样）；
+- **与安全距离组合**：`exclusion_margin_cm` 为正时许可范围向口袋内部收缩——
+  口袋内部距口袋边界不超过该距离的点继续 `FORBIDDEN`，分类 `NEAR_BOUNDARY`，
+  证据沿用既有精确距离形式（约分后的平方距离分数）并标注 `pocket_index`；
+- 未提交（或提交 `null`/空列表）时，请求与响应和当前版本完全一致。
+
+`PERMITTED_POCKET` 的证据示例：
+
+```json
+{
+  "type": "permitted_pocket",
+  "pocket_index": 0,
+  "rule": "点严格位于许可口袋内部，改判 ALLOWED；口袋按输入顺序归因，落在口袋边界上的点仍按禁抛区内部处理（FORBIDDEN）。"
+}
+```
 
 ### 未声明字段一律拒绝
 
@@ -101,7 +135,10 @@ docker compose run --rm verify
    通过真实 HTTP 调用核对：顺/逆时针与闭合写法等价、边界点稳定拒绝且边序号最小、
    内外分类与射线奇偶、非法区域只出现明确错误、500 点上限与顺序保持、1e8 大坐标精确性，
    以及安全距离（边中段阈值翻转、顶点端点距离、约分分数证据、顺/逆时针边序归因稳定、
-   零安全距离与缺省完全等价、非法安全距离整单 422）。
+   零安全距离与缺省完全等价、非法安全距离整单 422），
+   以及许可口袋（口袋内部放行与输入顺序归因、口袋边界禁抛、安全距离带向口袋内部
+   收缩、口袋相交/接触/嵌套与越出区域整单 422、11 个口袋与总顶点超限拒绝、
+   未提交口袋时响应与当前版本完全一致）。
 
 本地不用 Docker 时：
 
@@ -212,11 +249,15 @@ pytest
 | `code` | 触发条件 | 典型 `details` |
 | --- | --- | --- |
 | `VALIDATION_ERROR` | JSON 结构错误、坐标非整数/越界、顶点数不在 3～201、点数超过 500、安全距离非法（负数/非整数/超过坐标上限）等 | `issues`: 字段级问题列表 |
-| `CONSECUTIVE_DUPLICATE_VERTEX` | 连续重复顶点（含闭合处） | `vertex_index` |
-| `NOT_ENOUGH_DISTINCT_VERTICES` | 不同顶点少于 3 个 | `distinct_vertex_count` |
-| `TOO_MANY_VERTICES` | 规整后顶点超过 200 个 | `vertex_count` |
-| `ZERO_AREA_POLYGON` | 有向面积为 0（共线/退化） | — |
-| `SELF_INTERSECTING_POLYGON` | 非相邻边相交/接触/重叠，或相邻边共线回退 | `edge_indices` |
+| `CONSECUTIVE_DUPLICATE_VERTEX` | 连续重复顶点（含闭合处） | `vertex_index`（口袋另附 `pocket_index`） |
+| `NOT_ENOUGH_DISTINCT_VERTICES` | 不同顶点少于 3 个 | `distinct_vertex_count`（口袋另附 `pocket_index`） |
+| `TOO_MANY_VERTICES` | 规整后顶点超过 200 个 | `vertex_count`（口袋另附 `pocket_index`） |
+| `ZERO_AREA_POLYGON` | 有向面积为 0（共线/退化） | —（口袋另附 `pocket_index`） |
+| `SELF_INTERSECTING_POLYGON` | 非相邻边相交/接触/重叠，或相邻边共线回退 | `edge_indices`（口袋另附 `pocket_index`） |
+| `TOO_MANY_POCKETS` | 许可口袋超过 10 个 | `pocket_count` |
+| `TOO_MANY_TOTAL_VERTICES` | 外环与全部口袋规整后的总顶点数超过 500 | `total_vertex_count` |
+| `POCKET_NOT_INSIDE_REGION` | 口袋顶点不在禁抛区内部（含压在边界上），或口袋边与区域边存在公共点 | `pocket_index`，`vertex_index` 或 `edge_indices` |
+| `POCKETS_INTERSECT` | 两个口袋的边相交/接触/重叠，或相互嵌套 | `pocket_indices`（可含 `edge_indices`） |
 
 ## 测试策略（不固定结果）
 
@@ -230,8 +271,12 @@ pytest
 - **安全距离**：边中段外侧点按阈值翻转为 `NEAR_BOUNDARY`、顶点附近按线段端点距离
   命中、刚越过阈值放行、平方距离分数约分、顺/逆时针边序归因稳定、零安全距离与
   缺省响应完全一致、非法安全距离整单 422；
+- **许可口袋**：口袋内部点放行并携带输入顺序的 `pocket_index`、口袋边界点维持
+  禁抛、安全距离带向口袋内部收缩（恰等于阈值仍禁抛）、口袋相交/接触/嵌套与越出
+  禁抛区整单 422、11 个口袋与总顶点数超过 500 拒绝（恰好 500 受理）、
+  缺省/`null`/空列表与未提交字段响应完全一致；
 - **随机性质测试**：`test_random_polygons_match_exact_reference` 生成大量随机星形简单
   多边形（顺/逆时针各一遍），用标准库 `fractions.Fraction` 写的独立精确参照实现对拍，
   包含各顶点周围 3×3 邻域与随机探针——期望由数学参照实时计算，不固化任何结果；
   `test_random_nearest_edge_matches_fraction_reference` 以同样方式对拍最近边序号
-  （同距取最小序号）与约分后的平方距离分数。
+  （同距先比到边所在直线的垂直距离、再取最小边序号）与约分后的平方距离分数。

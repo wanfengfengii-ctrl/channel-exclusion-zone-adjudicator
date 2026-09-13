@@ -5,12 +5,23 @@ POST /adjudicate
 
         {"region": {"vertices": [{"x": .., "y": ..}, ...]},
          "points": [{"x": .., "y": ..}, ...],
-         "exclusion_margin_cm": 0}   # 可选，缺省为 0
+         "exclusion_margin_cm": 0,      # 可选，缺省为 0
+         "permitted_pockets": null}     # 可选，缺省为无口袋
 
     区域非法时整个请求返回 422，绝不返回部分结果；区域合法时按输入
     顺序给出每个点的裁决与证据。exclusion_margin_cm 为正时，距任一
     边不超过该距离的外部点改判 FORBIDDEN 并标记为 NEAR_BOUNDARY；
     缺省或传 0 时响应结构、分类与证据和旧接口完全一致。
+
+    permitted_pockets 在禁抛区内部划定临时许可口袋：最多 10 个简单
+    多边形，每个沿用区域顶点规则，外环与全部口袋规整后的总顶点数
+    不超过 500；每个口袋必须严格位于禁抛区内部且彼此不接触、不
+    重叠，任一非法整单 422（details 携带口袋序号或计数）。点严格
+    落入某口袋内部时改判 ALLOWED 并标记 PERMITTED_POCKET（证据
+    携带按输入顺序归因的口袋序号）；落在口袋边界上仍为 FORBIDDEN。
+    安全距离为正时许可范围向口袋内部收缩：口袋内部距口袋边界不超
+    过该距离的点继续禁抛，沿用既有精确距离证据并标注口袋序号。
+    未提交 permitted_pockets 时请求响应与当前版本完全一致。
 GET /healthz
     存活探针，供 Docker Compose 的 verify 服务等待 API 就绪。
 """
@@ -23,9 +34,12 @@ from fastapi.responses import JSONResponse
 from .geometry import (
     Classification,
     NearestEdge,
+    Polygon,
     PolygonError,
     classify,
+    containing_pocket,
     nearest_edge,
+    prepare_pockets,
     prepare_polygon,
     within_exclusion_margin,
 )
@@ -33,8 +47,8 @@ from .models import AdjudicateRequest, AdjudicateResponse, PointModel, PointResu
 
 app = FastAPI(
     title="Dredging Spoil Dumping Adjudication Service",
-    version="1.1.0",
-    description="纯整数计算几何：判定点位于禁抛区内部、外部还是边界，支持边界安全距离。",
+    version="1.2.0",
+    description="纯整数计算几何：判定点位于禁抛区内部、外部还是边界，支持边界安全距离与区内许可口袋。",
 )
 
 
@@ -83,9 +97,11 @@ def ray_evidence(cls: Classification) -> dict:
     }
 
 
-def near_boundary_evidence(poly, near: NearestEdge, margin_cm: int) -> dict:
+def near_boundary_evidence(
+    poly, near: NearestEdge, margin_cm: int, pocket_index: int | None = None
+) -> dict:
     (ax, ay), (bx, by) = poly.edge(near.edge_index)
-    return {
+    evidence = {
         "type": "near_boundary",
         "edge_index": near.edge_index,
         "edge": [[ax, ay], [bx, by]],
@@ -95,12 +111,34 @@ def near_boundary_evidence(poly, near: NearestEdge, margin_cm: int) -> dict:
         "rule": "外部点到最近边的距离不超过 exclusion_margin_cm，改判 FORBIDDEN；"
         "距离平方以约分后的分数给出，最近距离相同取最小边序号。",
     }
+    if pocket_index is not None:
+        # 口袋内部的近边界点：同一精确距离证据，边序号相对该口袋。
+        evidence["pocket_index"] = pocket_index
+        evidence["rule"] = (
+            "许可口袋内部的点距口袋边界不超过 exclusion_margin_cm，许可范围向口袋内部收缩，"
+            "继续 FORBIDDEN；距离平方以约分后的分数给出，最近距离相同取最小边序号。"
+        )
+    return evidence
+
+
+def pocket_evidence(pocket_index: int) -> dict:
+    return {
+        "type": "permitted_pocket",
+        "pocket_index": pocket_index,
+        "rule": "点严格位于许可口袋内部，改判 ALLOWED；口袋按输入顺序归因，"
+        "落在口袋边界上的点仍按禁抛区内部处理（FORBIDDEN）。",
+    }
 
 
 @app.post("/adjudicate", response_model=AdjudicateResponse)
 def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
     raw = [[v.x, v.y] for v in req.region.vertices]
     poly = prepare_polygon(raw)  # 非法直接抛 PolygonError -> 422，无部分结果
+    # 许可口袋：缺省、null 或空列表时无口袋，行为与旧接口完全一致。
+    pockets: list[Polygon] = []
+    if req.permitted_pockets:
+        raw_pockets = [[[v.x, v.y] for v in pocket.vertices] for pocket in req.permitted_pockets]
+        pockets = prepare_pockets(poly, raw_pockets)  # 任一非法 -> 422，无部分结果
     margin = req.exclusion_margin_cm
 
     results: list[PointResult] = []
@@ -111,9 +149,25 @@ def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
             classification = "BOUNDARY"
             evidence = edge_evidence(poly, cls.boundary_edge)
         elif cls.kind == "INSIDE":
-            decision = "FORBIDDEN"
-            classification = "INSIDE"
-            evidence = ray_evidence(cls)
+            pocket_idx = containing_pocket(pockets, p.x, p.y) if pockets else None
+            if pocket_idx is None:
+                # 不在任何口袋严格内部（含落在口袋边界上）：维持原裁决。
+                decision = "FORBIDDEN"
+                classification = "INSIDE"
+                evidence = ray_evidence(cls)
+            else:
+                pocket = pockets[pocket_idx]
+                # 安全距离为正时许可范围向口袋内部收缩：距口袋边界不超过
+                # 该距离的点继续禁抛，沿用既有精确距离证据并标注口袋序号。
+                near = nearest_edge(pocket, p.x, p.y) if margin > 0 else None
+                if near is not None and within_exclusion_margin(near, margin):
+                    decision = "FORBIDDEN"
+                    classification = "NEAR_BOUNDARY"
+                    evidence = near_boundary_evidence(pocket, near, margin, pocket_index=pocket_idx)
+                else:
+                    decision = "ALLOWED"
+                    classification = "PERMITTED_POCKET"
+                    evidence = pocket_evidence(pocket_idx)
         else:
             # 外部点：安全距离为正且距最近边不超过该距离时改判禁抛。
             near = nearest_edge(poly, p.x, p.y) if margin > 0 else None

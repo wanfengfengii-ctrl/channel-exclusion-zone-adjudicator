@@ -347,3 +347,207 @@ def test_undeclared_field_on_region_vertex_rejected():
     body = r.json()
     assert body["error"]["code"] == "VALIDATION_ERROR"
     assert ("body", "region", "vertices", 0, "elevation") in _locs(body)
+
+
+# ---------------------------------------------------------------------------
+# permitted_pockets 许可口袋
+# ---------------------------------------------------------------------------
+
+BIG = [(0, 0), (100, 0), (100, 100), (0, 100)]
+POCKET_A = [(10, 10), (20, 10), (20, 20), (10, 20)]
+POCKET_B = [(40, 40), (50, 40), (50, 50), (40, 50)]
+
+
+def post_pockets(region, points, pockets, margin=None):
+    payload = {
+        "region": {"vertices": [{"x": x, "y": y} for x, y in region]},
+        "points": points,
+        "permitted_pockets": [
+            {"vertices": [{"x": x, "y": y} for x, y in pocket]} for pocket in pockets
+        ],
+    }
+    if margin is not None:
+        payload["exclusion_margin_cm"] = margin
+    return client.post("/adjudicate", json=payload)
+
+
+def ngon(n, cx, cy, r):
+    from math import cos, pi, sin
+    return [(cx + round(r * cos(2 * pi * k / n)),
+             cy + round(r * sin(2 * pi * k / n))) for k in range(n)]
+
+
+def test_pocket_interior_points_allowed_with_input_order_index():
+    r = post_pockets(
+        BIG,
+        [{"x": 15, "y": 15}, {"x": 45, "y": 45}, {"x": 30, "y": 30}, {"x": 150, "y": 150}],
+        [POCKET_A, POCKET_B],
+    )
+    assert r.status_code == 200
+    a, b, c, d = r.json()["results"]
+    # 口袋内部点放行，证据按输入顺序携带口袋序号。
+    assert a["decision"] == "ALLOWED" and a["classification"] == "PERMITTED_POCKET"
+    assert a["evidence"]["type"] == "permitted_pocket" and a["evidence"]["pocket_index"] == 0
+    assert b["decision"] == "ALLOWED" and b["classification"] == "PERMITTED_POCKET"
+    assert b["evidence"]["pocket_index"] == 1
+    # 区域内部、口袋之外的点维持原裁决。
+    assert c["decision"] == "FORBIDDEN" and c["classification"] == "INSIDE"
+    assert c["evidence"]["type"] == "horizontal_ray"
+    # 区域外部点不受口袋影响。
+    assert d["decision"] == "ALLOWED" and d["classification"] == "OUTSIDE"
+    assert d["evidence"]["type"] == "horizontal_ray"
+
+
+def test_pocket_boundary_points_still_forbidden_via_original_chain():
+    # 口袋的边与顶点上的点：仍按禁抛区内部处理（FORBIDDEN/INSIDE + 射线证据）。
+    pts = [{"x": 10, "y": 15}, {"x": 20, "y": 20}, {"x": 15, "y": 10}]
+    r = post_pockets(BIG, pts, [POCKET_A])
+    assert r.status_code == 200
+    for item in r.json()["results"]:
+        assert item["decision"] == "FORBIDDEN"
+        assert item["classification"] == "INSIDE"
+        assert item["evidence"]["type"] == "horizontal_ray"
+
+
+def test_pocket_margin_shrinks_permission_toward_interior():
+    # 安全距离 3：许可范围向口袋内部收缩。
+    # (12,15) 距左边 2 <= 3 -> 禁抛；(13,15) 距左边 3 == 3 -> 禁抛；(15,15) 距最近边 5 > 3 -> 放行。
+    r = post_pockets(BIG, [{"x": 12, "y": 15}, {"x": 13, "y": 15}, {"x": 15, "y": 15}],
+                     [POCKET_A], margin=3)
+    assert r.status_code == 200
+    near, edge_case, free = r.json()["results"]
+    assert near["decision"] == "FORBIDDEN" and near["classification"] == "NEAR_BOUNDARY"
+    ev = near["evidence"]
+    assert ev["type"] == "near_boundary" and ev["pocket_index"] == 0
+    assert ev["edge_index"] == 3 and ev["edge"] == [[10, 20], [10, 10]]
+    assert (ev["distance2_num"], ev["distance2_den"]) == (4, 1)
+    assert ev["exclusion_margin_cm"] == 3
+    assert edge_case["decision"] == "FORBIDDEN" and edge_case["classification"] == "NEAR_BOUNDARY"
+    assert (edge_case["evidence"]["distance2_num"], edge_case["evidence"]["distance2_den"]) == (9, 1)
+    assert free["decision"] == "ALLOWED" and free["classification"] == "PERMITTED_POCKET"
+
+
+def test_pocket_margin_does_not_leak_to_region_boundary_evidence():
+    # 区域外部点的安全距离证据仍相对禁抛区边，不夹带口袋序号。
+    r = post_pockets(BIG, [{"x": 5, "y": -3}], [POCKET_A], margin=3)
+    item = r.json()["results"][0]
+    assert item["classification"] == "NEAR_BOUNDARY" and item["decision"] == "FORBIDDEN"
+    assert "pocket_index" not in item["evidence"]
+    assert item["evidence"]["edge_index"] == 0
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        [(15, 15), (25, 15), (25, 25), (15, 25)],   # 边交叉重叠
+        [(20, 10), (30, 10), (30, 20), (20, 20)],   # 共边接触
+        [(12, 12), (18, 12), (18, 18), (12, 18)],   # 嵌套
+    ],
+)
+def test_pockets_intersect_rejects_whole_order(second):
+    r = post_pockets(BIG, [{"x": 15, "y": 15}], [POCKET_A, second])
+    assert r.status_code == 422
+    body = r.json()
+    assert set(body) == {"error"}
+    assert body["error"]["code"] == "POCKETS_INTERSECT"
+    assert body["error"]["details"]["pocket_indices"] == [0, 1]
+    assert "results" not in body
+
+
+def test_pocket_outside_region_rejects_whole_order():
+    r = post_pockets(BIG, [{"x": 15, "y": 15}], [[(90, 90), (110, 90), (110, 110), (90, 110)]])
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "POCKET_NOT_INSIDE_REGION"
+    assert body["error"]["details"]["pocket_index"] == 0
+    assert "results" not in body
+
+
+def test_pocket_topology_error_carries_index_and_rejects_whole_order():
+    bowtie = [(10, 10), (20, 20), (20, 10), (10, 18)]
+    r = post_pockets(BIG, [{"x": 15, "y": 15}], [POCKET_A, bowtie])
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "SELF_INTERSECTING_POLYGON"
+    assert body["error"]["details"]["pocket_index"] == 1
+    assert "results" not in body
+
+
+def test_eleven_pockets_rejected_with_count():
+    pockets = [[(10 + 8 * k, 10), (16 + 8 * k, 10), (16 + 8 * k, 16), (10 + 8 * k, 16)]
+               for k in range(11)]
+    r = post_pockets(BIG, [{"x": 15, "y": 15}], pockets)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "TOO_MANY_POCKETS"
+    assert body["error"]["details"]["pocket_count"] == 11
+    assert "results" not in body
+
+
+def test_total_vertex_count_over_500_rejected_with_count():
+    region = [(0, 0), (40000, 0), (40000, 5000), (0, 5000)]
+    pockets = [ngon(50, 2000 + 3000 * k, 2500, 1000) for k in range(10)]
+    # 4 + 10 * 50 = 504 > 500：整单 422 并给出总顶点计数。
+    r = post_pockets(region, [], pockets)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "TOO_MANY_TOTAL_VERTICES"
+    assert body["error"]["details"]["total_vertex_count"] == 504
+    assert "results" not in body
+
+
+def test_total_vertex_count_exactly_500_accepted():
+    region = [(0, 0), (40000, 0), (40000, 5000), (0, 5000)]
+    pockets = [ngon(50, 2000 + 3000 * k, 2500, 1000) for k in range(9)]
+    pockets.append(ngon(46, 29000, 2500, 1000))
+    # 4 + 9 * 50 + 46 = 500：恰好达到上限，正常裁决。
+    r = post_pockets(region, [{"x": 2000, "y": 2500}, {"x": 29000, "y": 2500}], pockets)
+    assert r.status_code == 200
+    first, last = r.json()["results"]
+    assert first["classification"] == "PERMITTED_POCKET" and first["evidence"]["pocket_index"] == 0
+    assert last["classification"] == "PERMITTED_POCKET" and last["evidence"]["pocket_index"] == 9
+
+
+def test_missing_null_and_empty_pockets_are_legacy_compatible():
+    pts = [{"x": 15, "y": 15}, {"x": 5, "y": -1}, {"x": 0, "y": 0}, {"x": 150, "y": 150}]
+    baseline = post(BIG, pts)
+    assert baseline.status_code == 200
+    # 显式空列表与 null 均等同于未提交：响应逐字节一致，且不出现口袋分类。
+    assert post_pockets(BIG, pts, []).json() == baseline.json()
+    r_null = client.post(
+        "/adjudicate",
+        json={
+            "region": {"vertices": [{"x": x, "y": y} for x, y in BIG]},
+            "points": pts,
+            "permitted_pockets": None,
+        },
+    )
+    assert r_null.json() == baseline.json()
+    assert all(item["classification"] != "PERMITTED_POCKET" for item in baseline.json()["results"])
+
+
+def test_undeclared_field_on_pocket_rejected():
+    r = client.post(
+        "/adjudicate",
+        json={
+            "region": {"vertices": [{"x": x, "y": y} for x, y in BIG]},
+            "points": [],
+            "permitted_pockets": [
+                {"vertices": [{"x": x, "y": y} for x, y in POCKET_A], "label": "P-1"}
+            ],
+        },
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "VALIDATION_ERROR"
+    assert ("body", "permitted_pockets", 0, "label") in _locs(body)
+
+
+def test_pocket_vertex_rules_match_region_rules():
+    # 非整数坐标拒绝、末尾闭合写法等价，均与区域规则一致。
+    r = post_pockets(BIG, [], [[(10, 10), (20, 10), (20, 20), (10, 20), (10, 10)]])
+    assert r.status_code == 200
+    for bad in (True, "10", 10.0):
+        r_bad = post_pockets(BIG, [], [[(10, 10), (20, 10), (bad, 20), (10, 20)]])
+        assert r_bad.status_code == 422, bad
+        assert r_bad.json()["error"]["code"] == "VALIDATION_ERROR", bad

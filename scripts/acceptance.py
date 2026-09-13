@@ -10,6 +10,7 @@
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -33,13 +34,17 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         failures.append(f"{name}: {detail}")
 
 
-def call(vertices, points, *, margin=None, expect_status=200):
+def call(vertices, points, *, margin=None, pockets=None, expect_status=200):
     payload = {
         "region": {"vertices": [{"x": x, "y": y} for x, y in vertices]},
         "points": [{"x": x, "y": y} for x, y in points],
     }
     if margin is not None:
         payload["exclusion_margin_cm"] = margin
+    if pockets is not None:
+        payload["permitted_pockets"] = [
+            {"vertices": [{"x": x, "y": y} for x, y in pocket]} for pocket in pockets
+        ]
     body = json.dumps(payload).encode()
     req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
     try:
@@ -64,13 +69,19 @@ def wait_ready(timeout: float = 60.0) -> None:
     raise SystemExit("API did not become ready in time")
 
 
-def decisions(vertices, points, *, margin=None):
-    _, data = call(vertices, points, margin=margin)
+def decisions(vertices, points, *, margin=None, pockets=None):
+    _, data = call(vertices, points, margin=margin, pockets=pockets)
     return data["results"], data.get("polygon")
 
 
 def grid(lo, hi, step):
     return [(x, y) for x in range(lo, hi + 1, step) for y in range(lo, hi + 1, step)]
+
+
+def ngon(n, cx, cy, r):
+    """近似正 n 边形的整数顶点（半径足够大，取整后不会并点或自交）。"""
+    return [(cx + round(r * math.cos(2 * math.pi * k / n)),
+             cy + round(r * math.sin(2 * math.pi * k / n))) for k in range(n)]
 
 
 def main() -> int:
@@ -315,6 +326,113 @@ def main() -> int:
         check(f"非法安全距离（{label}）整单 422 且无结果",
               status == 422 and body["error"]["code"] == "VALIDATION_ERROR" and "results" not in body,
               f"{status} {str(body)[:200]}")
+
+    # --- 8. permitted_pockets 许可口袋 --------------------------------------
+    print("[8] permitted_pockets 许可口袋")
+    big = [(0, 0), (100, 0), (100, 100), (0, 100)]
+    pa = [(10, 10), (20, 10), (20, 20), (10, 20)]
+    pb = [(40, 40), (50, 40), (50, 50), (40, 50)]
+
+    # 口袋内部放行并按输入顺序归因；口袋外的区域内部点维持禁抛。
+    res, _ = decisions(big, [(15, 15), (45, 45), (30, 30)], pockets=[pa, pb])
+    check("口袋内部点 ALLOWED + PERMITTED_POCKET 且按输入顺序携带口袋序号",
+          res[0]["decision"] == "ALLOWED" and res[0]["classification"] == "PERMITTED_POCKET"
+          and res[0]["evidence"].get("type") == "permitted_pocket"
+          and res[0]["evidence"].get("pocket_index") == 0
+          and res[1]["decision"] == "ALLOWED" and res[1]["classification"] == "PERMITTED_POCKET"
+          and res[1]["evidence"].get("pocket_index") == 1,
+          json.dumps(res[:2], ensure_ascii=False))
+    check("口袋外的区域内部点维持 INSIDE + FORBIDDEN（射线证据）",
+          res[2]["classification"] == "INSIDE" and res[2]["decision"] == "FORBIDDEN"
+          and res[2]["evidence"].get("type") == "horizontal_ray",
+          json.dumps(res[2], ensure_ascii=False))
+
+    # 口袋边界（边与顶点）上的点仍禁抛，证据保持原裁决链路形式。
+    res, _ = decisions(big, [(10, 15), (20, 20), (15, 10)], pockets=[pa])
+    check("口袋边界（边与顶点）上的点仍 FORBIDDEN 且证据为原射线形式",
+          all(r["decision"] == "FORBIDDEN" and r["classification"] == "INSIDE"
+              and r["evidence"].get("type") == "horizontal_ray" for r in res),
+          json.dumps(res, ensure_ascii=False))
+
+    # 安全距离：许可范围向口袋内部收缩，距口袋边界不超过该距离继续禁抛。
+    res, _ = decisions(big, [(12, 15), (13, 15), (15, 15)], margin=3, pockets=[pa])
+    ev = res[0]["evidence"]
+    check("距口袋边界小于安全距离的点继续禁抛（既有精确距离证据 + 口袋序号）",
+          res[0]["classification"] == "NEAR_BOUNDARY" and res[0]["decision"] == "FORBIDDEN"
+          and ev.get("type") == "near_boundary" and ev.get("pocket_index") == 0
+          and (ev.get("distance2_num"), ev.get("distance2_den")) == (4, 1)
+          and ev.get("exclusion_margin_cm") == 3,
+          json.dumps(res[0], ensure_ascii=False))
+    check("距口袋边界恰等于安全距离的点同样禁抛",
+          res[1]["classification"] == "NEAR_BOUNDARY" and res[1]["decision"] == "FORBIDDEN"
+          and (res[1]["evidence"].get("distance2_num"),
+               res[1]["evidence"].get("distance2_den")) == (9, 1),
+          json.dumps(res[1], ensure_ascii=False))
+    check("口袋内超出安全距离带的点放行",
+          res[2]["classification"] == "PERMITTED_POCKET" and res[2]["decision"] == "ALLOWED",
+          json.dumps(res[2], ensure_ascii=False))
+
+    # 口袋相交/接触/嵌套：整单 422，给出两个口袋序号。
+    for name, second in [("边交叉重叠", [(15, 15), (25, 15), (25, 25), (15, 25)]),
+                         ("共边接触", [(20, 10), (30, 10), (30, 20), (20, 20)]),
+                         ("嵌套", [(12, 12), (18, 12), (18, 18), (12, 18)])]:
+        status, body = call(big, [(15, 15)], pockets=[pa, second], expect_status=422)
+        check(f"口袋{name}整单 422 且无结果",
+              status == 422 and body["error"]["code"] == "POCKETS_INTERSECT"
+              and body["error"]["details"].get("pocket_indices") == [0, 1]
+              and "results" not in body,
+              f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+
+    # 口袋未严格位于禁抛区内部：顶点在外、顶点压边界、顶点全在内部但边穿越凹区域边界。
+    concave_region = [(0, 0), (100, 0), (100, 20), (20, 20), (20, 80), (100, 80), (100, 100), (0, 100)]
+    not_inside = [
+        ("顶点在区域外", big, [(90, 90), (110, 90), (110, 110), (90, 110)]),
+        ("顶点压在区域边界上", big, [(0, 10), (10, 10), (10, 20), (0, 20)]),
+        ("顶点全在内部但边穿越区域边界", concave_region, [(40, 10), (60, 10), (50, 90)]),
+    ]
+    for name, region, pocket in not_inside:
+        status, body = call(region, [(15, 15)], pockets=[pocket], expect_status=422)
+        check(f"口袋{name}整单 422 并给出口袋序号",
+              status == 422 and body["error"]["code"] == "POCKET_NOT_INSIDE_REGION"
+              and body["error"]["details"].get("pocket_index") == 0
+              and "results" not in body,
+              f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+
+    # 数量与总顶点超限：整单 422 并给出计数。
+    eleven = [[(10 + 8 * k, 10), (16 + 8 * k, 10), (16 + 8 * k, 16), (10 + 8 * k, 16)]
+              for k in range(11)]
+    status, body = call(big, [(15, 15)], pockets=eleven, expect_status=422)
+    check("11 个口袋整单 422 并给出口袋计数",
+          status == 422 and body["error"]["code"] == "TOO_MANY_POCKETS"
+          and body["error"]["details"].get("pocket_count") == 11
+          and "results" not in body,
+          f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+
+    wide = [(0, 0), (40000, 0), (40000, 5000), (0, 5000)]
+    over = [ngon(50, 2000 + 3000 * k, 2500, 1000) for k in range(10)]
+    status, body = call(wide, [], pockets=over, expect_status=422)
+    check("外环与口袋总顶点 504 超限整单 422 并给出总顶点计数",
+          status == 422 and body["error"]["code"] == "TOO_MANY_TOTAL_VERTICES"
+          and body["error"]["details"].get("total_vertex_count") == 504
+          and "results" not in body,
+          f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+    at_limit = [ngon(50, 2000 + 3000 * k, 2500, 1000) for k in range(9)]
+    at_limit.append(ngon(46, 29000, 2500, 1000))
+    res, _ = decisions(wide, [(2000, 2500), (29000, 2500)], pockets=at_limit)
+    check("总顶点数恰为 500 时正常裁决并按输入顺序归因",
+          res[0]["classification"] == "PERMITTED_POCKET" and res[0]["decision"] == "ALLOWED"
+          and res[0]["evidence"].get("pocket_index") == 0
+          and res[1]["classification"] == "PERMITTED_POCKET"
+          and res[1]["evidence"].get("pocket_index") == 9,
+          json.dumps(res, ensure_ascii=False)[:300])
+
+    # 未提交（或提交空列表）时响应与当前版本完全一致。
+    probes2 = [(15, 15), (5, -1), (0, 0), (150, 150)]
+    _, body_missing = call(big, probes2)
+    _, body_empty = call(big, probes2, pockets=[])
+    check("空口袋列表与未提交字段响应完全一致",
+          body_missing == body_empty
+          and all(r["classification"] != "PERMITTED_POCKET" for r in body_missing["results"]))
 
     print(f"\n== {checks} checks, {len(failures)} failures ==")
     if failures:

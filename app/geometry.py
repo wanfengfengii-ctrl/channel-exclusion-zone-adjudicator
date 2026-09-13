@@ -17,7 +17,13 @@
 安全距离（exclusion_margin_cm）支持由 ``nearest_edge`` 与
 ``within_exclusion_margin`` 提供：外部点距最近边的距离不超过安全
 距离时，HTTP 层将其改判为 NEAR_BOUNDARY；证据中的平方距离以约分
-分数（分子/分母）给出，最近距离相同取最小边序号。
+分数（分子/分母）给出。
+
+许可口袋（permitted_pockets）由 ``prepare_pockets`` 规整与校验：
+数量上限、单口袋拓扑（沿用区域全部顶点规则）、外环与全部口袋的
+总顶点数、每个口袋严格位于禁抛区内部、口袋两两不接触不重叠；
+``containing_pocket`` 按输入顺序返回严格包含待判点的第一个口袋
+序号，供 HTTP 层把口袋内部点改判为 ALLOWED。
 """
 
 from dataclasses import dataclass
@@ -27,6 +33,8 @@ COORD_LIMIT = 100_000_000
 MIN_VERTEX_COUNT = 3
 MAX_VERTEX_COUNT = 200
 MAX_POINT_COUNT = 500
+MAX_POCKET_COUNT = 10
+MAX_TOTAL_VERTEX_COUNT = 500
 
 
 class PolygonError(ValueError):
@@ -336,18 +344,37 @@ class NearestEdge:
 def nearest_edge(poly: Polygon, px: int, py: int) -> NearestEdge:
     """返回距 P 最近的边及最短平方距离（约分后的分子/分母）。
 
-    按边序号升序扫描，仅在严格更小时更新最佳值（交叉相乘比较分数），
-    因此最近距离相同——例如顶点两侧的两条邻边端点距离相等——时
-    自然保留最小边序号。
+    逐级平局规则（全程整数交叉相乘比较，无浮点）：
+    1. 主键为夹取后的最短平方距离，仅在严格更小时更新；
+    2. 距离相同（典型情形：P 位于某顶点的外侧夹角区，到两条邻边
+       的最短距离都等于到该顶点的距离）时，取到边所在直线的垂直
+       平方距离更小者——这是与顶点编号无关的几何量，保证顺/逆
+       时针区域把同一点归因到同一条几何边；
+    3. 仍相同（如顶点角平分线上的点，几何上无法区分）时保留
+       先扫描到的边，即最小边序号。
     """
 
     best_i = -1
     best_num = best_den = 0
+    best_perp_num = best_perp_den = 0
     for i in range(poly.edge_count):
         (ax, ay), (bx, by) = poly.edge(i)
         num, den = segment_distance2(px, py, ax, ay, bx, by)
-        if best_i < 0 or num * best_den < best_num * den:
+        cr = cross(ax, ay, bx, by, px, py)
+        perp_num = cr * cr
+        perp_den = (bx - ax) * (bx - ax) + (by - ay) * (by - ay)
+        if best_i < 0:
+            take = True
+        else:
+            lhs, rhs = num * best_den, best_num * den
+            if lhs != rhs:
+                take = lhs < rhs
+            else:
+                # 距离并列：垂直距离更小者胜；仍并列则保留最小边序号。
+                take = perp_num * best_perp_den < best_perp_num * perp_den
+        if take:
             best_i, best_num, best_den = i, num, den
+            best_perp_num, best_perp_den = perp_num, perp_den
     g = gcd(best_num, best_den)
     return NearestEdge(
         edge_index=best_i, dist2_num=best_num // g, dist2_den=best_den // g
@@ -358,3 +385,136 @@ def within_exclusion_margin(near: NearestEdge, margin_cm: int) -> bool:
     """最短距离不超过安全距离的精确整数判定：num/den <= margin²。"""
 
     return near.dist2_num <= margin_cm * margin_cm * near.dist2_den
+
+
+# ---------------------------------------------------------------------------
+# 许可口袋：严格位于禁抛区内部、彼此不接触不重叠的简单多边形
+# ---------------------------------------------------------------------------
+
+def prepare_pockets(
+    region: Polygon, raw_pockets: list[list[list[int]]]
+) -> list[Polygon]:
+    """规整并校验许可口袋列表，返回与输入同序的口袋多边形。
+
+    校验顺序：数量 -> 逐口袋沿用区域顶点规则规整 -> 外环与全部口袋
+    规整后的总顶点数 -> 每个口袋严格位于禁抛区内部 -> 口袋两两不
+    接触不重叠。任何一步失败都抛 ``PolygonError``（请求级 422，
+    无部分结果），details 携带对应的口袋序号或计数。
+    """
+
+    if len(raw_pockets) > MAX_POCKET_COUNT:
+        raise PolygonError(
+            "TOO_MANY_POCKETS",
+            f"许可口袋最多 {MAX_POCKET_COUNT} 个，收到 {len(raw_pockets)} 个。",
+            pocket_count=len(raw_pockets),
+        )
+
+    pockets: list[Polygon] = []
+    for idx, raw in enumerate(raw_pockets):
+        try:
+            pockets.append(prepare_polygon(raw))
+        except PolygonError as exc:
+            # 单口袋拓扑非法：沿用区域错误码，补充口袋序号后整单 422。
+            raise PolygonError(
+                exc.code,
+                f"许可口袋 {idx}：{exc.message}",
+                pocket_index=idx,
+                **exc.details,
+            ) from exc
+
+    total = len(region.vertices) + sum(len(p.vertices) for p in pockets)
+    if total > MAX_TOTAL_VERTEX_COUNT:
+        raise PolygonError(
+            "TOO_MANY_TOTAL_VERTICES",
+            f"外环与全部口袋规整后的总顶点数最多 {MAX_TOTAL_VERTEX_COUNT} 个，实际 {total} 个。",
+            total_vertex_count=total,
+        )
+
+    for idx, pocket in enumerate(pockets):
+        _require_pocket_strictly_inside(region, pocket, idx)
+    for i in range(len(pockets)):
+        for j in range(i + 1, len(pockets)):
+            _require_pockets_disjoint(pockets[i], pockets[j], i, j)
+    return pockets
+
+
+def _require_pocket_strictly_inside(
+    region: Polygon, pocket: Polygon, pocket_index: int
+) -> None:
+    """口袋必须严格位于禁抛区内部：全部顶点严格在内，且任意口袋边
+    与区域边无公共点。两者兼备时整条口袋边界都在区域内部；口袋边界
+    是有界闭曲线，其内部随之完全落在区域内部（否则内部必含区域外点，
+    与边界不相交矛盾）。"""
+
+    for vi, (x, y) in enumerate(pocket.vertices):
+        cls = classify(region, x, y)
+        if cls.kind != "INSIDE":
+            where = "边界上" if cls.kind == "BOUNDARY" else "外部"
+            raise PolygonError(
+                "POCKET_NOT_INSIDE_REGION",
+                f"许可口袋 {pocket_index} 的顶点 {vi} 位于禁抛区{where}，"
+                "口袋必须严格位于禁抛区内部。",
+                pocket_index=pocket_index,
+                vertex_index=vi,
+            )
+    for ei in range(pocket.edge_count):
+        a, b = pocket.edge(ei)
+        for ri in range(region.edge_count):
+            c, d = region.edge(ri)
+            if segments_intersect(a, b, c, d):
+                raise PolygonError(
+                    "POCKET_NOT_INSIDE_REGION",
+                    f"许可口袋 {pocket_index} 的边 {ei} 与禁抛区边 {ri} 存在公共点，"
+                    "口袋必须严格位于禁抛区内部。",
+                    pocket_index=pocket_index,
+                    edge_indices=[ei, ri],
+                )
+
+
+def _require_pockets_disjoint(
+    first: Polygon, second: Polygon, i: int, j: int
+) -> None:
+    """两口袋不得接触或重叠：任意边无公共点，且互不嵌套。"""
+
+    for ei in range(first.edge_count):
+        a, b = first.edge(ei)
+        for ej in range(second.edge_count):
+            c, d = second.edge(ej)
+            if segments_intersect(a, b, c, d):
+                raise PolygonError(
+                    "POCKETS_INTERSECT",
+                    f"许可口袋 {i} 的边 {ei} 与许可口袋 {j} 的边 {ej} 存在公共点，"
+                    "口袋之间不得接触或重叠。",
+                    pocket_indices=[i, j],
+                    edge_indices=[ei, ej],
+                )
+    # 边无公共点时，两多边形要么完全分离，要么一个整体嵌套在另一个内部；
+    # 嵌套当且仅当一方的任一顶点落在另一方内部（顶点不可能恰落在对方
+    # 边界上——那意味着边存在公共点，已在上面拒绝）。
+    x, y = first.vertices[0]
+    if classify(second, x, y).kind == "INSIDE":
+        raise PolygonError(
+            "POCKETS_INTERSECT",
+            f"许可口袋 {i} 整体嵌套在许可口袋 {j} 内部，口袋之间不得接触或重叠。",
+            pocket_indices=[i, j],
+        )
+    x, y = second.vertices[0]
+    if classify(first, x, y).kind == "INSIDE":
+        raise PolygonError(
+            "POCKETS_INTERSECT",
+            f"许可口袋 {j} 整体嵌套在许可口袋 {i} 内部，口袋之间不得接触或重叠。",
+            pocket_indices=[i, j],
+        )
+
+
+def containing_pocket(pockets: list[Polygon], px: int, py: int) -> int | None:
+    """返回严格包含 P 的第一个口袋序号（按输入顺序归因）；无则 None。
+
+    口袋两两不接触不重叠，P 至多严格位于一个口袋内部；落在口袋边界
+    上不算包含（边界点仍按禁抛区内部处理，维持 FORBIDDEN）。
+    """
+
+    for idx, pocket in enumerate(pockets):
+        if classify(pocket, px, py).kind == "INSIDE":
+            return idx
+    return None

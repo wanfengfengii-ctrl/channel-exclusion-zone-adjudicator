@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .geometry import COORD_LIMIT, MAX_POINT_COUNT, MAX_VERTEX_COUNT
 
 Decision = Literal["FORBIDDEN", "ALLOWED"]
-ClassificationKind = Literal["INSIDE", "OUTSIDE", "BOUNDARY", "NEAR_BOUNDARY"]
+ClassificationKind = Literal["INSIDE", "OUTSIDE", "BOUNDARY", "NEAR_BOUNDARY", "PERMITTED_POCKET"]
 
 
 class StrictRequestModel(BaseModel):
@@ -37,6 +37,10 @@ class RegionModel(StrictRequestModel):
     vertices: list[PointModel] = Field(min_length=3, max_length=MAX_VERTEX_COUNT + 1)
 
 
+class PocketModel(RegionModel):
+    """许可口袋：顶点规则与禁抛区完全一致（3～200 个不同顶点，允许末尾闭合写法）。"""
+
+
 class AdjudicateRequest(StrictRequestModel):
     region: RegionModel
     points: list[PointModel] = Field(max_length=MAX_POINT_COUNT)
@@ -49,6 +53,14 @@ class AdjudicateRequest(StrictRequestModel):
         ge=0,
         le=COORD_LIMIT,
         description="可选安全距离：外部点距任一边不超过该值时改判 FORBIDDEN/NEAR_BOUNDARY",
+    )
+    # 可选许可口袋列表：每个口袋都是严格位于禁抛区内部、彼此不接触不重叠的
+    # 简单多边形。数量上限（10 个）与外环加全部口袋规整后的总顶点数上限
+    # （500）在几何层校验，分别给出携带计数/序号的显式错误码。缺省、null
+    # 或空列表时行为与旧接口完全一致。
+    permitted_pockets: list[PocketModel] | None = Field(
+        default=None,
+        description="可选许可口袋：严格位于禁抛区内部、互不接触重叠的简单多边形，最多 10 个",
     )
 
 

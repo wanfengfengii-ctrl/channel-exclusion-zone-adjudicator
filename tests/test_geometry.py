@@ -7,14 +7,19 @@
 
 import random
 from fractions import Fraction
+from math import cos, pi, sin
 
 import pytest
 
 from app.geometry import (
     MAX_POINT_COUNT,
+    MAX_POCKET_COUNT,
+    MAX_TOTAL_VERTEX_COUNT,
     PolygonError,
     classify,
+    containing_pocket,
     nearest_edge,
+    prepare_pockets,
     prepare_polygon,
     segment_distance2,
     within_exclusion_margin,
@@ -298,9 +303,21 @@ def test_nearest_edge_picks_segment_and_reduces_fraction():
 
 def test_nearest_edge_vertex_tie_returns_smallest_index():
     poly = prepare_polygon(SQUARE_CCW)
-    # (-2,-1) 最近的是顶点 (0,0)：边 0 与边 3 的端点距离同为 sqrt(5)，取最小序号。
+    # (-2,-1) 最近的是顶点 (0,0)：边 0 与边 3 的端点距离同为 sqrt(5)，
+    # 到底边所在直线 y=0 的垂直距离（1）小于到左边所在直线 x=0 的距离（2），
+    # 归到底边——恰也是最小序号。
     near = nearest_edge(poly, -2, -1)
     assert (near.edge_index, near.dist2_num, near.dist2_den) == (0, 5, 1)
+
+
+def test_nearest_edge_vertex_tie_is_orientation_invariant():
+    # 同一几何正方形顺/逆时针（CW 锚在 (0,0)，底边序号为 3）：顶点平局
+    # 必须归到同一条几何边（底边），不受顶点编号影响。
+    a = nearest_edge(prepare_polygon(SQUARE_CCW), -2, -1)
+    b = nearest_edge(prepare_polygon(SQUARE_CW), -2, -1)
+    assert (a.dist2_num, a.dist2_den) == (b.dist2_num, b.dist2_den) == (5, 1)
+    assert (a.edge_index, b.edge_index) == (0, 3)
+    assert {SQUARE_CCW[0], SQUARE_CCW[1]} == {SQUARE_CW[3], SQUARE_CW[0]} == {(0, 0), (10, 0)}
 
 
 def test_nearest_edge_orientation_reversal_attributes_same_segment():
@@ -347,14 +364,152 @@ def test_random_nearest_edge_matches_fraction_reference():
         m = len(pts)
         probes = [(rng.randint(-160, 160), rng.randint(-160, 160)) for _ in range(30)]
         for px, py in probes:
-            dists = [
-                reference_segment_dist2(px, py, *pts[i], *pts[(i + 1) % m])
-                for i in range(m)
-            ]
-            best = min(dists)
-            want_idx = dists.index(best)  # 首个最小值 <=> 同距取最小边序号
+            keys = []
+            for i in range(m):
+                ax, ay = pts[i]
+                bx, by = pts[(i + 1) % m]
+                d2 = reference_segment_dist2(px, py, ax, ay, bx, by)
+                # 次键：到边所在直线的垂直平方距离（顺/逆时针不变的几何量）。
+                cr = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+                perp2 = Fraction(cr * cr, (bx - ax) ** 2 + (by - ay) ** 2)
+                keys.append((d2, perp2, i))
+            want_d2, _, want_idx = min(keys)  # 同距先比垂直距离，再取最小边序号
             near = nearest_edge(poly, px, py)
             assert near.edge_index == want_idx, f"{pts} point={(px,py)}"
-            assert Fraction(near.dist2_num, near.dist2_den) == best
+            assert Fraction(near.dist2_num, near.dist2_den) == want_d2
             checked += 1
     assert checked > 1000
+
+
+# ---------------------------------------------------------------------------
+# 许可口袋：规整、包含校验、互斥校验与按输入顺序归因
+# ---------------------------------------------------------------------------
+
+REGION_100 = [(0, 0), (100, 0), (100, 100), (0, 100)]
+POCKET_A = [(10, 10), (20, 10), (20, 20), (10, 20)]
+POCKET_B = [(40, 40), (50, 40), (50, 50), (40, 50)]
+
+
+def ngon(n, cx, cy, r):
+    """近似正 n 边形的整数顶点（半径足够大，取整后不会并点或自交）。"""
+    return [(cx + round(r * cos(2 * pi * k / n)),
+             cy + round(r * sin(2 * pi * k / n))) for k in range(n)]
+
+
+def test_pocket_constants():
+    assert MAX_POCKET_COUNT == 10
+    assert MAX_TOTAL_VERTEX_COUNT == 500
+
+
+def test_prepare_pockets_accepts_and_preserves_input_order():
+    region = prepare_polygon(REGION_100)
+    pockets = prepare_pockets(region, [POCKET_B, POCKET_A])
+    assert [p.vertices for p in pockets] == [tuple(POCKET_B), tuple(POCKET_A)]
+
+
+def test_pocket_closing_point_is_equivalent():
+    region = prepare_polygon(REGION_100)
+    a = prepare_pockets(region, [POCKET_A])
+    b = prepare_pockets(region, [POCKET_A + [POCKET_A[0]]])
+    assert a[0].vertices == b[0].vertices == tuple(POCKET_A)
+
+
+def test_containing_pocket_attributes_in_input_order():
+    region = prepare_polygon(REGION_100)
+    pockets = prepare_pockets(region, [POCKET_A, POCKET_B])
+    assert containing_pocket(pockets, 15, 15) == 0
+    assert containing_pocket(pockets, 45, 45) == 1
+    assert containing_pocket(pockets, 30, 30) is None    # 区域内部、任何口袋之外
+    assert containing_pocket(pockets, 10, 15) is None    # 口袋边界不算包含
+    assert containing_pocket(pockets, 20, 20) is None    # 口袋顶点不算包含
+    assert containing_pocket(pockets, 200, 200) is None  # 区域之外
+    assert containing_pocket([], 15, 15) is None
+
+
+def test_too_many_pockets_rejected_with_count():
+    region = prepare_polygon(REGION_100)
+    many = [[(10 + 8 * k, 10), (16 + 8 * k, 10), (16 + 8 * k, 16), (10 + 8 * k, 16)]
+            for k in range(11)]
+    with pytest.raises(PolygonError) as ei:
+        prepare_pockets(region, many)
+    assert ei.value.code == "TOO_MANY_POCKETS"
+    assert ei.value.details["pocket_count"] == 11
+
+
+def test_total_vertex_count_limit_rejected_with_count():
+    region = prepare_polygon(ngon(200, 100_000, 100_000, 50_000))
+    pockets = [ngon(50, 100_000 + round(20_000 * cos(2 * pi * k / 8)),
+                    100_000 + round(20_000 * sin(2 * pi * k / 8)), 1000)
+               for k in range(8)]
+    with pytest.raises(PolygonError) as ei:
+        prepare_pockets(region, pockets)
+    assert ei.value.code == "TOO_MANY_TOTAL_VERTICES"
+    assert ei.value.details["total_vertex_count"] == 200 + 8 * 50
+
+
+def test_total_vertex_count_exactly_at_limit_accepted():
+    region = prepare_polygon(ngon(200, 100_000, 100_000, 50_000))
+    pockets = [ngon(50, 100_000 + round(20_000 * cos(2 * pi * k / 6)),
+                    100_000 + round(20_000 * sin(2 * pi * k / 6)), 1000)
+               for k in range(6)]
+    # 200 + 6 * 50 = 500，恰好达到上限，必须正常受理。
+    prepared = prepare_pockets(region, pockets)
+    assert len(prepared) == 6
+    assert len(region.vertices) + sum(len(p.vertices) for p in prepared) == 500
+
+
+def test_pocket_topology_error_carries_pocket_index():
+    region = prepare_polygon(REGION_100)
+    bowtie = [(10, 10), (20, 20), (20, 10), (10, 18)]  # 非对称蝴蝶结（区域内坐标）
+    with pytest.raises(PolygonError) as ei:
+        prepare_pockets(region, [POCKET_A, bowtie])
+    assert ei.value.code == "SELF_INTERSECTING_POLYGON"
+    assert ei.value.details["pocket_index"] == 1
+    assert ei.value.details["edge_indices"] == [0, 2]
+
+
+@pytest.mark.parametrize(
+    "pocket,vertex_index",
+    [
+        ([(90, 90), (110, 90), (110, 110), (90, 110)], 1),  # 顶点在区域外
+        ([(0, 10), (10, 10), (10, 20), (0, 20)], 0),        # 顶点压在区域边界上
+        ([(0, 0), (10, 0), (10, 10)], 0),                   # 顶点与区域顶点重合
+        ([(95, 10), (105, 10), (105, 20), (95, 20)], 1),    # 整体在区域外
+    ],
+)
+def test_pocket_not_strictly_inside_region_vertices(pocket, vertex_index):
+    region = prepare_polygon(REGION_100)
+    with pytest.raises(PolygonError) as ei:
+        prepare_pockets(region, [pocket])
+    assert ei.value.code == "POCKET_NOT_INSIDE_REGION"
+    assert ei.value.details["pocket_index"] == 0
+    assert ei.value.details["vertex_index"] == vertex_index
+
+
+def test_pocket_edge_crossing_concave_region_rejected():
+    # 顶点全部严格在凹区域内部，但边穿越区域边界（横跨凹口）。
+    concave = prepare_polygon([(0, 0), (100, 0), (100, 20), (20, 20),
+                               (20, 80), (100, 80), (100, 100), (0, 100)])
+    with pytest.raises(PolygonError) as ei:
+        prepare_pockets(concave, [[(40, 10), (60, 10), (50, 90)]])
+    assert ei.value.code == "POCKET_NOT_INSIDE_REGION"
+    assert ei.value.details["pocket_index"] == 0
+    assert ei.value.details["edge_indices"] == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        [(15, 15), (25, 15), (25, 25), (15, 25)],   # 边交叉重叠
+        [(20, 10), (30, 10), (30, 20), (20, 20)],   # 共边接触
+        [(20, 20), (30, 20), (30, 30), (20, 30)],   # 顶点相触（A 的顶点 (20,20)）
+        [(12, 12), (18, 12), (18, 18), (12, 18)],   # 嵌套在 A 内
+        [(5, 5), (25, 5), (25, 25), (5, 25)],       # 整体包含 A
+    ],
+)
+def test_pockets_intersect_variants_rejected(second):
+    region = prepare_polygon(REGION_100)
+    with pytest.raises(PolygonError) as ei:
+        prepare_pockets(region, [POCKET_A, second])
+    assert ei.value.code == "POCKETS_INTERSECT"
+    assert ei.value.details["pocket_indices"] == [0, 1]
