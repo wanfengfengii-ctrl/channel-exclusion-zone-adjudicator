@@ -19,7 +19,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .geometry import COORD_LIMIT, MAX_POINT_COUNT
+from .geometry import COORD_LIMIT, MAX_POINT_COUNT, MAX_WAYPOINT_COUNT
 
 Decision = Literal["FORBIDDEN", "ALLOWED"]
 ClassificationKind = Literal["INSIDE", "OUTSIDE", "BOUNDARY", "NEAR_BOUNDARY", "PERMITTED_POCKET"]
@@ -123,3 +123,41 @@ class RegionAreaSummaryResponse(BaseModel):
     region_area2: int = Field(description="外环（禁抛区）的绝对二倍面积")
     pockets: list[PocketAreaSummary]
     net_area2: int = Field(description="扣除全部口袋后的二倍面积：region_area2 - sum(pockets.area2)")
+
+
+class TrackAdjudicateRequest(StrictRequestModel):
+    """连续航迹裁决请求：与裁决一致的 region + 2～100 个有序航点。
+
+    航点数量上下限在本层约束（结构错误 -> VALIDATION_ERROR 整单 422）；
+    坐标沿用 PointModel 的严格整数规则；区域合法性仍在几何层裁决。
+    相邻航点相同（零长度航段）合法，按单点规则处理。不接收待判点、
+    安全距离与许可口袋：未声明字段由 extra="forbid" 整单 422 拒绝。
+    """
+
+    region: RegionModel
+    waypoints: list[PointModel] = Field(
+        min_length=2,
+        max_length=MAX_WAYPOINT_COUNT,
+        description="有序航点（2～100 个），相邻航点构成一条航段",
+    )
+
+
+class TrackContactModel(BaseModel):
+    segment_index: int = Field(description="最早受限航段序号（0 起）")
+    t_num: int = Field(description="该段首次接触参数 t 的约分分子（0 <= t <= 1）")
+    t_den: int = Field(description="t 的约分分母（恒正）")
+    x_num: int = Field(description="接触点 x 坐标的约分分子")
+    x_den: int = Field(description="x 坐标的约分分母（恒正）")
+    y_num: int = Field(description="接触点 y 坐标的约分分子")
+    y_den: int = Field(description="y 坐标的约分分母（恒正）")
+    edge_index: int | None = Field(
+        description="接触点命中的最小输入边序号；接触点严格在区域内部（起点已禁抛）时为 null"
+    )
+
+
+class TrackAdjudicateResponse(BaseModel):
+    polygon: PolygonSummary
+    verdict: Literal["CLEAR", "BLOCKED"]
+    contact: TrackContactModel | None = Field(
+        description="verdict 为 BLOCKED 时给出首次接触证据，CLEAR 时为 null"
+    )

@@ -27,6 +27,12 @@
 
 面积汇总由 ``doubled_area`` 提供：返回多边形绝对二倍面积（整数，
 与顶点方向及闭合写法无关），供 /region-area-summary 核对申报面积。
+
+连续航迹裁决由 ``track_first_contact`` 提供：复用多边形规整、点分类、
+叉积与边界归因，以约分有理数计算并比较各航段与区域边界的接触位置，
+返回最早受限航段的首次接触（航段序号、接触参数、接触坐标、边序号）；
+起点已禁抛时参数为零，共线贴边取重叠起点，同点命中多边时取最小输入
+边序号，零长度航段按单点规则处理。全程整数与有理数比较，无浮点。
 """
 
 from dataclasses import dataclass
@@ -36,6 +42,7 @@ COORD_LIMIT = 100_000_000
 MIN_VERTEX_COUNT = 3
 MAX_VERTEX_COUNT = 200
 MAX_POINT_COUNT = 500
+MAX_WAYPOINT_COUNT = 100
 MAX_POCKET_COUNT = 10
 MAX_TOTAL_VERTEX_COUNT = 500
 
@@ -511,4 +518,150 @@ def containing_pocket(pockets: list[Polygon], px: int, py: int) -> int | None:
     for idx, pocket in enumerate(pockets):
         if classify(pocket, px, py).kind == "INSIDE":
             return idx
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 连续航迹裁决：航段与区域边界的首次接触（约分有理数）
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TrackContact:
+    """整条航迹的首次禁抛接触证据；参数与坐标均为约分有理数（分母恒正）。
+
+    ``t_num/t_den`` 为最早受限航段上的首次接触参数（0 <= t <= 1），
+    接触点 P(t) = A + t*(B-A)；``x_num/x_den``、``y_num/y_den`` 为接触点
+    坐标。``edge_index`` 为接触点命中的最小输入边序号；接触点严格位于
+    区域内部（仅当航段起点已禁抛、参数为零时可能出现）时不存在边界边，
+    为 None。
+    """
+
+    segment_index: int
+    t_num: int
+    t_den: int
+    x_num: int
+    x_den: int
+    y_num: int
+    y_den: int
+    edge_index: int | None
+
+
+def _reduce_ratio(num: int, den: int) -> tuple[int, int]:
+    """约分有理数并把符号归一到分子：分母恒正，0 表示为 0/1。"""
+
+    if den < 0:
+        num, den = -num, -den
+    g = gcd(num, den)
+    return num // g, den // g
+
+
+def segment_edge_contact_t(
+    ax: int, ay: int, bx: int, by: int, cx: int, cy: int, dx: int, dy: int
+) -> tuple[int, int] | None:
+    """航段 A->B 与边 C->D 的首次接触参数（约分 t_num/t_den），无公共点返回 None。
+
+    P(t) = A + t*(B-A)，t ∈ [0,1]。共线重叠时返回重叠起点的参数（重叠是
+    闭区间，起点即最小参数）。调用方保证 A != B（零长度航段按单点规则
+    另行处理）；全程整数，交点范围检查用交叉相乘完成，不引入浮点。
+    """
+
+    ux, uy = bx - ax, by - ay
+    vx, vy = dx - cx, dy - cy
+    f0 = cross(cx, cy, dx, dy, ax, ay)  # cross(C, D, A)：A 相对边线的有向偏差
+    f1 = vx * uy - vy * ux              # cross(C, D, P(t)) 关于 t 的系数
+
+    if f1 == 0:
+        if f0 != 0:
+            return None  # 平行且不共线：永不相交
+        # 共线：把边的两端投影为航段参数（U 非零，取非零分量），
+        # 求 [0,1] 与 [tC, tD] 的重叠起点。
+        if ux != 0:
+            tc = _reduce_ratio(cx - ax, ux)
+            td = _reduce_ratio(dx - ax, ux)
+        else:
+            tc = _reduce_ratio(cy - ay, uy)
+            td = _reduce_ratio(dy - ay, uy)
+        if tc[0] * td[1] <= td[0] * tc[1]:
+            lo, hi = tc, td
+        else:
+            lo, hi = td, tc
+        t_num, t_den = lo if lo[0] > 0 else (0, 1)  # 重叠起点 = max(0, lo)
+        # 重叠非空 <=> max(0, lo) <= min(1, hi)
+        if t_num > t_den or t_num * hi[1] > hi[0] * t_den:
+            return None
+        return t_num, t_den
+
+    # 非平行：cross(C, D, P(t)) = f0 + t*f1 的唯一零点 t0 = -f0/f1。
+    t_num, t_den = _reduce_ratio(-f0, f1)
+    if t_num < 0 or t_num > t_den:
+        return None  # 交点不在航段参数范围内
+    # 交点必在边所在直线上，落在边上 <=> 落在边的包围盒内（交叉相乘比较）。
+    qx = ax * t_den + ux * t_num  # Qx = qx / t_den，t_den > 0
+    qy = ay * t_den + uy * t_num
+    if not (min(cx, dx) * t_den <= qx <= max(cx, dx) * t_den):
+        return None
+    if not (min(cy, dy) * t_den <= qy <= max(cy, dy) * t_den):
+        return None
+    return t_num, t_den
+
+
+def segment_first_contact(
+    poly: Polygon, ax: int, ay: int, bx: int, by: int
+) -> tuple[int, int, int | None] | None:
+    """单航段 A->B 的首次禁抛接触：(t_num, t_den, edge_index)；畅通返回 None。
+
+    * 起点已禁抛（内部或边界）时参数为零，边界起点按最小边序号归因，
+      严格内部的起点不存在边界边，边序号为 None；
+    * 起点放行时，接触位置为航段与区域边界的最小交点参数；共线贴边
+      取重叠起点，同一参数命中多条边（顶点）时取最小输入边序号；
+    * 零长度航段按单点规则处理：起点放行即整段畅通。
+    """
+
+    cls = classify(poly, ax, ay)
+    if cls.kind != "OUTSIDE":
+        return 0, 1, cls.boundary_edge
+    if (ax, ay) == (bx, by):
+        return None
+    best: tuple[int, int] | None = None
+    best_edge: int | None = None
+    for k in range(poly.edge_count):
+        (cx, cy), (dx, dy) = poly.edge(k)
+        hit = segment_edge_contact_t(ax, ay, bx, by, cx, cy, dx, dy)
+        if hit is None:
+            continue
+        # 交叉相乘比较有理数参数；严格更小才更新 => 同参数保留最小边序号。
+        if best is None or hit[0] * best[1] < best[0] * hit[1]:
+            best, best_edge = hit, k
+    if best is None:
+        return None
+    return best[0], best[1], best_edge
+
+
+def track_first_contact(
+    poly: Polygon, waypoints: list[tuple[int, int]]
+) -> TrackContact | None:
+    """按输入顺序扫描连续航迹，返回最早受限航段的首次接触；全程畅通返回 None。
+
+    接触参数与接触坐标均为约分有理数：P(t) = A + t*(B-A)。
+    """
+
+    for i in range(len(waypoints) - 1):
+        ax, ay = waypoints[i]
+        bx, by = waypoints[i + 1]
+        hit = segment_first_contact(poly, ax, ay, bx, by)
+        if hit is None:
+            continue
+        t_num, t_den, edge_index = hit
+        x_num, x_den = _reduce_ratio(ax * t_den + (bx - ax) * t_num, t_den)
+        y_num, y_den = _reduce_ratio(ay * t_den + (by - ay) * t_num, t_den)
+        return TrackContact(
+            segment_index=i,
+            t_num=t_num,
+            t_den=t_den,
+            x_num=x_num,
+            x_den=x_den,
+            y_num=y_num,
+            y_den=y_den,
+            edge_index=edge_index,
+        )
     return None

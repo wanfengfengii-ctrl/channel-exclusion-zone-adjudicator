@@ -34,6 +34,20 @@ POST /region-area-summary
     以二倍整数（平方厘米的二倍）给出：汇总值 = 外环绝对二倍面积
     - 全部口袋绝对二倍面积，与顶点顺/逆时针方向及末尾重复闭合点
     写法无关。本接口不接收待判点与安全距离。
+POST /adjudicate-track
+    入参::
+
+        {"region": {"vertices": [{"x": .., "y": ..}, ...]},
+         "waypoints": [{"x": .., "y": ..}, ...]}   # 2～100 个有序航点
+
+    连续航迹裁决：逐点裁决会漏掉两个放行航点之间的越界航段，本接口按
+    输入顺序检查每条航段是否穿入禁抛区（边界含在内），返回 CLEAR 或
+    BLOCKED。阻断时给出最早受限航段序号、该段首次接触参数 t（约分
+    有理数，P(t) = A + t*(B-A)）、接触坐标（约分有理数）与命中的最小
+    输入边序号；起点已禁抛时参数为零，共线贴边取重叠起点，同一接触
+    点命中多条边（顶点）时取最小边序号，接触点严格在区域内部（起点
+    已禁抛）时边序号为 null。零长度航段按单点规则处理。航点数量、
+    坐标或区域非法时按统一错误信封整单返回 422，无部分结果。
 GET /healthz
     存活探针，供 Docker Compose 的 verify 服务等待 API 就绪。
 """
@@ -54,6 +68,7 @@ from .geometry import (
     nearest_edge,
     prepare_pockets,
     prepare_polygon,
+    track_first_contact,
     within_exclusion_margin,
 )
 from .models import (
@@ -65,12 +80,15 @@ from .models import (
     PolygonSummary,
     RegionAreaSummaryRequest,
     RegionAreaSummaryResponse,
+    TrackAdjudicateRequest,
+    TrackAdjudicateResponse,
+    TrackContactModel,
 )
 
 app = FastAPI(
     title="Dredging Spoil Dumping Adjudication Service",
-    version="1.3.0",
-    description="纯整数计算几何：判定点位于禁抛区内部、外部还是边界，支持边界安全距离、区内许可口袋与区域面积核对。",
+    version="1.4.0",
+    description="纯整数计算几何：判定点位于禁抛区内部、外部还是边界，支持边界安全距离、区内许可口袋、区域面积核对与连续航迹越界裁决。",
 )
 
 
@@ -246,6 +264,33 @@ def region_area_summary(req: RegionAreaSummaryRequest) -> RegionAreaSummaryRespo
         region_area2=region_area2,
         pockets=pocket_summaries,
         net_area2=net_area2,
+    )
+
+
+@app.post("/adjudicate-track", response_model=TrackAdjudicateResponse)
+def adjudicate_track(req: TrackAdjudicateRequest) -> TrackAdjudicateResponse:
+    # 与裁决一致的区域规整；区域非法时同一 422 信封，无部分结果。
+    raw = [[v.x, v.y] for v in req.region.vertices]
+    poly = prepare_polygon(raw)
+    contact = track_first_contact(poly, [(p.x, p.y) for p in req.waypoints])
+    return TrackAdjudicateResponse(
+        polygon=PolygonSummary(
+            vertex_count=len(poly.vertices),
+            edge_count=poly.edge_count,
+            orientation=poly.orientation,
+            signed_area2=poly.signed_area2,
+        ),
+        verdict="BLOCKED" if contact is not None else "CLEAR",
+        contact=None if contact is None else TrackContactModel(
+            segment_index=contact.segment_index,
+            t_num=contact.t_num,
+            t_den=contact.t_den,
+            x_num=contact.x_num,
+            x_den=contact.x_den,
+            y_num=contact.y_num,
+            y_den=contact.y_den,
+            edge_index=contact.edge_index,
+        ),
     )
 
 

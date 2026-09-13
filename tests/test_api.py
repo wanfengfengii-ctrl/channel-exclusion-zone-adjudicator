@@ -769,3 +769,178 @@ def test_pocket_with_too_few_vertices_reports_indexed_geometry_error():
         body = r.json()
         assert body["error"]["code"] == "NOT_ENOUGH_DISTINCT_VERTICES"
         assert body["error"]["details"]["pocket_index"] == 1
+
+
+# ---------------------------------------------------------------------------
+# POST /adjudicate-track 连续航迹裁决
+# ---------------------------------------------------------------------------
+
+def post_track(region, waypoints, **extra):
+    payload = {
+        "region": {"vertices": [{"x": x, "y": y} for x, y in region]},
+        "waypoints": [{"x": x, "y": y} for x, y in waypoints],
+    }
+    payload.update(extra)
+    return client.post("/adjudicate-track", json=payload)
+
+
+def test_track_clear_detour_returns_clear_with_polygon_summary():
+    r = post_track(SQUARE, [(-5, -5), (-5, 15), (15, 15), (15, -5)])
+    assert r.status_code == 200
+    data = r.json()
+    assert data["verdict"] == "CLEAR"
+    assert data["contact"] is None
+    # 区域概要与 /adjudicate 一致（规整后顶点/边数、朝向、有向二倍面积）。
+    assert data["polygon"] == {
+        "vertex_count": 4, "edge_count": 4, "orientation": "CCW", "signed_area2": 200,
+    }
+
+
+def test_track_crossing_between_free_endpoints_locates_first_entry():
+    # 航段 (-5,5)->(15,5) 两端逐点裁决均放行，但中途穿区：定位首次入口。
+    endpoints = post(SQUARE, [{"x": -5, "y": 5}, {"x": 15, "y": 5}]).json()["results"]
+    assert [item["decision"] for item in endpoints] == ["ALLOWED", "ALLOWED"]
+    r = post_track(SQUARE, [(-5, -5), (-5, 5), (15, 5)])
+    assert r.status_code == 200
+    data = r.json()
+    assert data["verdict"] == "BLOCKED"
+    contact = data["contact"]
+    assert contact["segment_index"] == 1  # 最早受限航段是第 1 段（第 0 段畅通）
+    assert (contact["t_num"], contact["t_den"]) == (1, 4)
+    assert (contact["x_num"], contact["x_den"]) == (0, 1)
+    assert (contact["y_num"], contact["y_den"]) == (5, 1)
+    assert contact["edge_index"] == 3
+
+
+def test_track_vertex_graze_blocks_stably_with_smallest_edge():
+    # 仅擦过顶点 (0,0) 不进入内部：稳定阻断，命中多边取最小边序号。
+    for _ in range(2):
+        r = post_track(SQUARE, [(-5, 5), (5, -5)])
+        assert r.status_code == 200
+        contact = r.json()["contact"]
+        assert r.json()["verdict"] == "BLOCKED"
+        assert (contact["t_num"], contact["t_den"]) == (1, 2)
+        assert (contact["x_num"], contact["y_num"]) == (0, 0)
+        assert contact["edge_index"] == 0
+
+
+def test_track_along_edge_blocks_at_overlap_start():
+    # 沿底边航行：与边 0 共线重叠，接触点为重叠起点 (0,0)。
+    r = post_track(SQUARE, [(-5, 0), (15, 0)])
+    assert r.status_code == 200
+    contact = r.json()["contact"]
+    assert r.json()["verdict"] == "BLOCKED"
+    assert (contact["t_num"], contact["t_den"]) == (1, 4)
+    assert (contact["x_num"], contact["y_num"]) == (0, 0)
+    assert contact["edge_index"] == 0
+
+
+def test_track_forbidden_start_has_zero_parameter():
+    # 起点严格在内部：参数为零，接触点即起点，无边界边可归因（null）。
+    r = post_track(SQUARE, [(5, 5), (20, 20)])
+    contact = r.json()["contact"]
+    assert r.json()["verdict"] == "BLOCKED"
+    assert (contact["t_num"], contact["t_den"]) == (0, 1)
+    assert (contact["x_num"], contact["y_num"]) == (5, 5)
+    assert contact["edge_index"] is None
+    # 起点压在边界上：参数为零，按最小边序号归因。
+    r = post_track(SQUARE, [(0, 0), (20, 20)])
+    contact = r.json()["contact"]
+    assert (contact["t_num"], contact["t_den"]) == (0, 1)
+    assert contact["edge_index"] == 0
+
+
+def test_track_zero_length_segment_single_point_rule():
+    # 零长度航段落在放行点：畅通。
+    r = post_track(SQUARE, [(20, 20), (20, 20)])
+    assert r.status_code == 200
+    assert r.json()["verdict"] == "CLEAR"
+    assert r.json()["contact"] is None
+    # 零长度航段落在禁抛点：阻断，参数为零。
+    r = post_track(SQUARE, [(5, 5), (5, 5)])
+    assert r.json()["verdict"] == "BLOCKED"
+    assert (r.json()["contact"]["t_num"], r.json()["contact"]["t_den"]) == (0, 1)
+
+
+def test_track_orientation_reversal_same_verdict_and_contact():
+    tracks = [
+        [(-5, -5), (-5, 5), (15, 5)],
+        [(-5, 5), (5, -5)],
+        [(-5, 0), (15, 0)],
+        [(5, 5), (20, 20)],
+        [(-5, -5), (-5, 15), (15, 15)],
+    ]
+    for wps in tracks:
+        a = post_track(SQUARE, wps).json()
+        b = post_track(SQUARE_CW, wps).json()
+        assert a["verdict"] == b["verdict"], wps
+        ca, cb = a["contact"], b["contact"]
+        assert (ca is None) == (cb is None), wps
+        if ca is not None:
+            # 结论、接触参数与接触坐标不随区域方向改变；边序号随编号变化，
+            # 但归属同一条几何边（端点集合一致，起点已禁抛时同为 null）。
+            for key in ("segment_index", "t_num", "t_den", "x_num", "x_den", "y_num", "y_den"):
+                assert ca[key] == cb[key], (wps, key)
+            if ca["edge_index"] is not None:
+                ea = SQUARE[ca["edge_index"]], SQUARE[(ca["edge_index"] + 1) % 4]
+                eb = SQUARE_CW[cb["edge_index"]], SQUARE_CW[(cb["edge_index"] + 1) % 4]
+                assert {*map(tuple, ea)} == {*map(tuple, eb)}, wps
+            else:
+                assert cb["edge_index"] is None
+
+
+def test_track_large_coordinates_exact_contact():
+    B = 100_000_000
+    tri = [(0, 0), (B, 0), (0, B)]
+    r = post_track(tri, [(B // 2, -1), (B // 2, B)])
+    assert r.status_code == 200
+    contact = r.json()["contact"]
+    assert (contact["t_num"], contact["t_den"]) == (1, B + 1)
+    assert (contact["x_num"], contact["x_den"]) == (B // 2, 1)
+    assert (contact["y_num"], contact["y_den"]) == (0, 1)
+
+
+def test_track_waypoint_count_limits():
+    # 1 个航点不足、101 个航点超限：整单 422；2 个与 100 个正常受理。
+    assert post_track(SQUARE, [(0, 0)]).status_code == 422
+    assert post_track(SQUARE, [(i, i) for i in range(101)]).status_code == 422
+    far = [(20 + i, 20 + i) for i in range(100)]  # 全部在区域外
+    assert post_track(SQUARE, far).status_code == 200
+    assert post_track(SQUARE, [(20, 20), (30, 30)]).status_code == 200
+    r = post_track(SQUARE, [(0, 0)])
+    body = r.json()
+    assert set(body) == {"error"}
+    assert body["error"]["code"] == "VALIDATION_ERROR"
+    assert "contact" not in body and "verdict" not in body
+
+
+def test_track_non_integer_and_out_of_range_waypoints_rejected():
+    for bad in (True, "5", 5.0, 10**9, -100_000_001):
+        r = post_track(SQUARE, [(0, 0), (bad, 0)])
+        assert r.status_code == 422, bad
+        body = r.json()
+        assert body["error"]["code"] == "VALIDATION_ERROR", bad
+        assert "verdict" not in body, bad
+
+
+def test_track_invalid_region_422_envelope():
+    r = post_track([(0, 0), (10, 10), (10, 0), (0, 8)], [(-5, -5), (15, 15)])
+    assert r.status_code == 422
+    body = r.json()
+    assert set(body) == {"error"}
+    assert body["error"]["code"] == "SELF_INTERSECTING_POLYGON"
+    assert "verdict" not in body and "contact" not in body
+
+
+def test_track_undeclared_fields_rejected():
+    # 不接收待判点、安全距离与许可口袋：未声明字段整单 422 并精确定位。
+    for name, extra in [
+        ("points", {"points": [{"x": 1, "y": 1}]}),
+        ("exclusion_margin_cm", {"exclusion_margin_cm": 3}),
+        ("permitted_pockets", {"permitted_pockets": []}),
+    ]:
+        r = post_track(SQUARE, [(0, 0), (20, 20)], **extra)
+        assert r.status_code == 422, name
+        body = r.json()
+        assert body["error"]["code"] == "VALIDATION_ERROR", name
+        assert ("body", name) in _locs(body), name

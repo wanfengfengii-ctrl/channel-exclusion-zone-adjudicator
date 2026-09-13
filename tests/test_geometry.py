@@ -15,6 +15,7 @@ from app.geometry import (
     MAX_POINT_COUNT,
     MAX_POCKET_COUNT,
     MAX_TOTAL_VERTEX_COUNT,
+    MAX_WAYPOINT_COUNT,
     PolygonError,
     classify,
     containing_pocket,
@@ -23,6 +24,8 @@ from app.geometry import (
     prepare_pockets,
     prepare_polygon,
     segment_distance2,
+    segment_edge_contact_t,
+    track_first_contact,
     within_exclusion_margin,
 )
 
@@ -565,3 +568,250 @@ def test_doubled_area_net_conservation_with_pockets():
     assert doubled_area(region) == 20000
     assert [doubled_area(p) for p in pockets] == [200, 200]
     assert net == 19600
+
+
+# ---------------------------------------------------------------------------
+# 连续航迹：航段与区域边界的首次接触（约分有理数）
+# ---------------------------------------------------------------------------
+
+def test_track_constants():
+    assert MAX_WAYPOINT_COUNT == 100
+
+
+def test_track_clear_when_detouring_around_region():
+    poly = prepare_polygon(SQUARE_CCW)
+    # 完全绕行：三段都贴着区域外侧走，全程畅通。
+    assert track_first_contact(poly, [(-5, -5), (-5, 15), (15, 15), (15, -5)]) is None
+    # 单航段远离区域也畅通。
+    assert track_first_contact(poly, [(-5, 5), (-1, 5)]) is None
+    # 起点与终点都在外部、航段从凹口上方掠过（凹多边形）。
+    concave = prepare_polygon(L_SHAPE_CCW)
+    assert track_first_contact(concave, [(8, 5), (8, 8)]) is None
+
+
+def test_track_first_entry_located_when_crossing_between_free_endpoints():
+    poly = prepare_polygon(SQUARE_CCW)
+    # 航段 (-5,5)->(15,5) 两端逐点裁决均放行，但中途穿区：首次入口在左边 (0,5)。
+    contact = track_first_contact(poly, [(-5, -5), (-5, 5), (15, 5)])
+    assert contact is not None
+    assert contact.segment_index == 1
+    assert (contact.t_num, contact.t_den) == (1, 4)
+    assert (contact.x_num, contact.x_den) == (0, 1)
+    assert (contact.y_num, contact.y_den) == (5, 1)
+    assert contact.edge_index == 3  # 左边 (0,10)->(0,0)
+
+
+def test_track_vertex_graze_blocks_with_smallest_edge_index():
+    poly = prepare_polygon(SQUARE_CCW)
+    # 航段 (-5,5)->(5,-5) 仅擦过顶点 (0,0)，不进入内部：仍稳定阻断。
+    contact = track_first_contact(poly, [(-5, 5), (5, -5)])
+    assert contact is not None
+    assert (contact.t_num, contact.t_den) == (1, 2)
+    assert (contact.x_num, contact.y_num) == (0, 0)
+    # 顶点 (0,0) 同时命中边 0 与边 3，取最小输入边序号。
+    assert contact.edge_index == 0
+
+
+def test_track_collinear_overlap_takes_overlap_start():
+    poly = prepare_polygon(SQUARE_CCW)
+    # 沿底边航行：航段 (-5,0)->(15,0) 与边 0 共线重叠，接触点为重叠起点 (0,0)。
+    contact = track_first_contact(poly, [(-5, 0), (15, 0)])
+    assert contact is not None
+    assert (contact.t_num, contact.t_den) == (1, 4)
+    assert (contact.x_num, contact.y_num) == (0, 0)
+    assert contact.edge_index == 0
+    # 重叠起点恰为顶点时同样命中多条边，取最小序号；此处 (0,0) 命中边 0 与 3。
+
+
+def test_track_forbidden_start_has_zero_parameter():
+    poly = prepare_polygon(SQUARE_CCW)
+    # 起点压在边界上：参数为零，按最小边序号归因。
+    c1 = track_first_contact(poly, [(0, 0), (20, 20)])
+    assert (c1.t_num, c1.t_den) == (0, 1)
+    assert (c1.x_num, c1.y_num) == (0, 0)
+    assert c1.edge_index == 0
+    # 起点严格在内部：参数为零，接触点不在任何边上，边序号为 None。
+    c2 = track_first_contact(poly, [(5, 5), (20, 20)])
+    assert (c2.t_num, c2.t_den) == (0, 1)
+    assert (c2.x_num, c2.y_num) == (5, 5)
+    assert c2.edge_index is None
+
+
+def test_track_zero_length_segment_single_point_rule():
+    poly = prepare_polygon(SQUARE_CCW)
+    # 零长度航段落在放行点：畅通。
+    assert track_first_contact(poly, [(20, 20), (20, 20)]) is None
+    # 零长度航段落在禁抛点：阻断，参数为零。
+    contact = track_first_contact(poly, [(5, 5), (5, 5)])
+    assert contact is not None
+    assert (contact.t_num, contact.t_den) == (0, 1)
+    # 零长度航段夹在中间：前段畅通时由后续航段裁决。
+    contact = track_first_contact(poly, [(20, 20), (20, 20), (5, 5)])
+    assert contact is not None
+    assert contact.segment_index == 1
+    assert (contact.t_num, contact.t_den) == (2, 3)  # 在顶点 (10,10) 处首次接触
+    assert (contact.x_num, contact.y_num) == (10, 10)
+    assert contact.edge_index == 1  # 顶点 (10,10) 命中边 1 与 2，取最小
+
+
+def test_track_earliest_restricted_segment_wins():
+    poly = prepare_polygon(SQUARE_CCW)
+    # 第 0 段畅通、第 1 段穿区、第 2 段起点在内部：只报告最早的第 1 段。
+    contact = track_first_contact(poly, [(-5, -5), (-5, 5), (5, 5), (20, 20)])
+    assert contact is not None
+    assert contact.segment_index == 1
+    assert (contact.x_num, contact.y_num) == (0, 5)
+
+
+def test_track_orientation_reversal_same_verdict_and_contact_point():
+    a = prepare_polygon(SQUARE_CCW)
+    b = prepare_polygon(list(reversed(SQUARE_CCW)))
+    tracks = [
+        [(-5, -5), (-5, 5), (15, 5)],   # 中途穿区
+        [(-5, 5), (5, -5)],             # 擦过顶点
+        [(-5, 0), (15, 0)],             # 沿边航行
+        [(5, 5), (20, 20)],             # 起点已禁抛
+        [(-5, -5), (-5, 15), (15, 15)], # 完全绕行
+    ]
+    for wps in tracks:
+        ca = track_first_contact(a, wps)
+        cb = track_first_contact(b, wps)
+        assert (ca is None) == (cb is None), wps
+        if ca is not None:
+            # 结论、航段序号、接触参数与接触坐标不随区域方向改变。
+            assert (ca.segment_index, ca.t_num, ca.t_den) == (cb.segment_index, cb.t_num, cb.t_den)
+            assert (ca.x_num, ca.x_den, ca.y_num, ca.y_den) == (
+                cb.x_num, cb.x_den, cb.y_num, cb.y_den)
+
+
+def test_track_large_coordinates_exact_rational_contact():
+    B = 100_000_000
+    tri = prepare_polygon([(0, 0), (B, 0), (0, B)])
+    # 航段 (B/2,-1)->(B/2,B)：在 (B/2, 0) 处穿入底边，t = 1/(B+1)。
+    contact = track_first_contact(tri, [(B // 2, -1), (B // 2, B)])
+    assert contact is not None
+    assert (contact.t_num, contact.t_den) == (1, B + 1)
+    assert (contact.x_num, contact.x_den) == (B // 2, 1)
+    assert (contact.y_num, contact.y_den) == (0, 1)
+    assert contact.edge_index == 0
+
+
+def test_segment_edge_contact_t_collinear_and_parallel():
+    # 平行不共线：永不相交。
+    assert segment_edge_contact_t(-5, 1, 15, 1, 0, 0, 10, 0) is None
+    # 共线但重叠在航段之外。
+    assert segment_edge_contact_t(-15, 0, -5, 0, 0, 0, 10, 0) is None
+    # 共线部分重叠：取重叠起点。
+    assert segment_edge_contact_t(-5, 0, 5, 0, 0, 0, 10, 0) == (1, 2)
+    # 共线且航段整段压在边上：起点即接触点（起点在边上时由单点规则先拦截，
+    # 这里直接调底层函数验证重叠起点为 t=0）。
+    assert segment_edge_contact_t(2, 0, 8, 0, 0, 0, 10, 0) == (0, 1)
+    # 非平行但交点在航段参数范围之外。
+    assert segment_edge_contact_t(0, 0, 1, 0, 5, -1, 5, 1) is None
+    # 非平行且交点在边的包围盒之外。
+    assert segment_edge_contact_t(0, 0, 10, 0, 5, -1, 5, -2) is None
+
+
+# ---------------------------------------------------------------------------
+# 连续航迹：Fraction 精确参照 + 随机航迹对拍
+# ---------------------------------------------------------------------------
+
+def reference_boundary_edge(vertices, px, py):
+    """精确参照：点命中的最小边序号；不在边上返回 None。"""
+    m = len(vertices)
+    for i in range(m):
+        ax, ay = vertices[i]
+        bx, by = vertices[(i + 1) % m]
+        cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+        if cross == 0 and min(ax, bx) <= px <= max(ax, bx) and min(ay, by) <= py <= max(ay, by):
+            return i
+    return None
+
+
+def reference_seg_edge_t(a, b, c, d):
+    """Fraction 精确参照：航段 a->b 与边 c->d 的首次接触参数，无公共点返回 None。"""
+    ax, ay = a
+    bx, by = b
+    cx, cy = c
+    dx, dy = d
+    ux, uy = bx - ax, by - ay
+    f0 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx)
+    f1 = (dx - cx) * uy - (dy - cy) * ux
+    if f1 == 0:
+        if f0 != 0:
+            return None
+        if ux != 0:
+            tc = Fraction(cx - ax, ux)
+            td = Fraction(dx - ax, ux)
+        else:
+            tc = Fraction(cy - ay, uy)
+            td = Fraction(dy - ay, uy)
+        lo, hi = min(tc, td), max(tc, td)
+        t = max(Fraction(0), lo)
+        return t if t <= 1 and t <= hi else None
+    t = Fraction(-f0, f1)
+    if t < 0 or t > 1:
+        return None
+    qx = Fraction(ax) + t * ux
+    qy = Fraction(ay) + t * uy
+    if not (min(cx, dx) <= qx <= max(cx, dx) and min(cy, dy) <= qy <= max(cy, dy)):
+        return None
+    return t
+
+
+def reference_track_contact(vertices, waypoints):
+    """Fraction 精确参照：最早受限航段的 (序号, t, 接触点, 边序号)；畅通返回 None。"""
+    m = len(vertices)
+    for i in range(len(waypoints) - 1):
+        a, b = waypoints[i], waypoints[i + 1]
+        cls = reference_classify(vertices, *a)
+        if cls != "OUTSIDE":
+            edge = reference_boundary_edge(vertices, *a) if cls == "BOUNDARY" else None
+            return i, Fraction(0), (Fraction(a[0]), Fraction(a[1])), edge
+        if a == b:
+            continue
+        best = None
+        for k in range(m):
+            t = reference_seg_edge_t(a, b, vertices[k], vertices[(k + 1) % m])
+            if t is not None and (best is None or t < best[0]):
+                best = (t, k)
+        if best is not None:
+            t, k = best
+            pt = (Fraction(a[0]) + t * (b[0] - a[0]), Fraction(a[1]) + t * (b[1] - a[1]))
+            return i, t, pt, k
+    return None
+
+
+def test_random_tracks_match_fraction_reference():
+    rng = random.Random(20260915)
+    checked = 0
+    for _ in range(200):
+        pts = random_star_polygon(rng)
+        if pts is None:
+            continue
+        xs = [x for x, _ in pts]
+        ys = [y for _, y in pts]
+        lo_x, hi_x = min(xs) - 10, max(xs) + 10
+        lo_y, hi_y = min(ys) - 10, max(ys) + 10
+        for rev in (pts, list(reversed(pts))):
+            poly = prepare_polygon(rev)
+            for _ in range(20):
+                n = rng.randint(2, 5)
+                wps = []
+                for _ in range(n):
+                    if rng.random() < 0.2:
+                        wps.append(rng.choice(pts))  # 顶点：边界起点（t=0 路径）
+                    else:
+                        wps.append((rng.randint(lo_x, hi_x), rng.randint(lo_y, hi_y)))
+                got = track_first_contact(poly, wps)
+                want = reference_track_contact(rev, wps)
+                assert (got is None) == (want is None), f"{rev} {wps}"
+                if got is not None:
+                    seg, t, pt, edge = want
+                    assert got.segment_index == seg, f"{rev} {wps}"
+                    assert Fraction(got.t_num, got.t_den) == t, f"{rev} {wps}"
+                    assert Fraction(got.x_num, got.x_den) == pt[0], f"{rev} {wps}"
+                    assert Fraction(got.y_num, got.y_den) == pt[1], f"{rev} {wps}"
+                    assert got.edge_index == edge, f"{rev} {wps}"
+                    checked += 1
+    assert checked > 500
