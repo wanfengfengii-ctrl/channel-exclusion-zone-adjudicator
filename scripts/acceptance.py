@@ -33,13 +33,14 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         failures.append(f"{name}: {detail}")
 
 
-def call(vertices, points, *, expect_status=200):
-    body = json.dumps(
-        {
-            "region": {"vertices": [{"x": x, "y": y} for x, y in vertices]},
-            "points": [{"x": x, "y": y} for x, y in points],
-        }
-    ).encode()
+def call(vertices, points, *, margin=None, expect_status=200):
+    payload = {
+        "region": {"vertices": [{"x": x, "y": y} for x, y in vertices]},
+        "points": [{"x": x, "y": y} for x, y in points],
+    }
+    if margin is not None:
+        payload["exclusion_margin_cm"] = margin
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -63,8 +64,8 @@ def wait_ready(timeout: float = 60.0) -> None:
     raise SystemExit("API did not become ready in time")
 
 
-def decisions(vertices, points):
-    _, data = call(vertices, points)
+def decisions(vertices, points, *, margin=None):
+    _, data = call(vertices, points, margin=margin)
     return data["results"], data.get("polygon")
 
 
@@ -233,6 +234,87 @@ def main() -> int:
           str(got))
     check("斜边命中边序号为 1", results[1]["evidence"]["edge_index"] == 1,
           str(results[1]["evidence"]))
+
+    # --- 7. exclusion_margin_cm 安全距离 ------------------------------------
+    print("[7] exclusion_margin_cm 安全距离")
+
+    # 边中段外侧点：距离恰为阈值 -> 改判禁抛；刚越过阈值 -> 放行。
+    res, _ = decisions(square, [(5, -3), (5, -4)], margin=3)
+    ev_near = res[0]["evidence"]
+    check("边中段外侧点距离等于阈值时改判 NEAR_BOUNDARY+FORBIDDEN",
+          res[0]["classification"] == "NEAR_BOUNDARY" and res[0]["decision"] == "FORBIDDEN"
+          and ev_near.get("type") == "near_boundary"
+          and ev_near.get("edge_index") == 0
+          and (ev_near.get("distance2_num"), ev_near.get("distance2_den")) == (9, 1)
+          and ev_near.get("exclusion_margin_cm") == 3,
+          json.dumps(res[0], ensure_ascii=False))
+    check("刚越过阈值的点保持 ALLOWED 且证据仍为射线形式",
+          res[1]["classification"] == "OUTSIDE" and res[1]["decision"] == "ALLOWED"
+          and res[1]["evidence"].get("type") == "horizontal_ray",
+          json.dumps(res[1], ensure_ascii=False))
+
+    # 顶点附近：按线段端点距离命中；两侧邻边等距时取最小边序号。
+    res, _ = decisions(square, [(-2, -1)], margin=3)
+    ev = res[0]["evidence"]
+    check("顶点附近按端点距离命中且同距取最小边序号",
+          res[0]["classification"] == "NEAR_BOUNDARY"
+          and ev.get("edge_index") == 0
+          and (ev.get("distance2_num"), ev.get("distance2_den")) == (5, 1),
+          json.dumps(res[0], ensure_ascii=False))
+    res, _ = decisions(square, [(-2, -1)], margin=2)
+    check("端点距离 sqrt(5) 刚越过阈值 2 时放行",
+          res[0]["classification"] == "OUTSIDE" and res[0]["decision"] == "ALLOWED",
+          json.dumps(res[0], ensure_ascii=False))
+
+    # 斜边外侧点：证据给出约分后的平方距离分数（900/200 -> 9/2）。
+    res, _ = decisions([(0, 0), (10, 0), (0, 10)], [(8, 5)], margin=3)
+    ev = res[0]["evidence"]
+    check("斜边外侧点证据为约分后的平方距离分数",
+          res[0]["classification"] == "NEAR_BOUNDARY"
+          and ev.get("edge_index") == 1
+          and (ev.get("distance2_num"), ev.get("distance2_den")) == (9, 2),
+          json.dumps(res[0], ensure_ascii=False))
+
+    # 顺/逆时针：归属同一条几何边（端点集合一致）、平方距离一致。
+    res_ccw, _ = decisions(square, [(5, -3), (-2, -1)], margin=5)
+    res_cw, _ = decisions(square_cw, [(5, -3), (-2, -1)], margin=5)
+    ok = True
+    for a, b in zip(res_ccw, res_cw):
+        if a["classification"] != "NEAR_BOUNDARY" or b["classification"] != "NEAR_BOUNDARY":
+            ok = False
+        ea, eb = a["evidence"], b["evidence"]
+        if {tuple(p) for p in ea["edge"]} != {tuple(p) for p in eb["edge"]}:
+            ok = False
+        if (ea["distance2_num"], ea["distance2_den"]) != (eb["distance2_num"], eb["distance2_den"]):
+            ok = False
+    check("顺/逆时针安全距离边序归因稳定（同一几何边、同一平方距离）", ok,
+          json.dumps([res_ccw, res_cw], ensure_ascii=False))
+
+    # 内部与边界点不受安全距离影响：分类与证据类型保持原样。
+    res, _ = decisions(square, [(5, 5), (0, 0), (10, 5)], margin=1000)
+    check("内部/边界点不受安全距离影响",
+          [r["classification"] for r in res] == ["INSIDE", "BOUNDARY", "BOUNDARY"]
+          and [r["decision"] for r in res] == ["FORBIDDEN"] * 3
+          and res[0]["evidence"]["type"] == "horizontal_ray"
+          and res[1]["evidence"]["type"] == "boundary"
+          and res[2]["evidence"]["type"] == "boundary",
+          json.dumps(res, ensure_ascii=False))
+
+    # 零安全距离与未传字段完全等价（旧接口行为不变）。
+    probes_small = [(5, -1), (5, 5), (0, 0), (-2, -1), (20, 20)]
+    _, body_default = call(square, probes_small)
+    _, body_zero = call(square, probes_small, margin=0)
+    check("零安全距离与未传字段响应完全一致",
+          body_default == body_zero
+          and all(r["classification"] != "NEAR_BOUNDARY" for r in body_zero["results"]))
+
+    # 非法安全距离：负数、非整数、超过坐标上限，整单 422 且无部分结果。
+    for label, bad in [("负数", -1), ("非整数浮点", 1.5), ("整数值浮点", 5.0),
+                       ("数字字符串", "3"), ("布尔", True), ("超过坐标上限", 100_000_001)]:
+        status, body = call(square, [(5, 5)], margin=bad, expect_status=422)
+        check(f"非法安全距离（{label}）整单 422 且无结果",
+              status == 422 and body["error"]["code"] == "VALIDATION_ERROR" and "results" not in body,
+              f"{status} {str(body)[:200]}")
 
     print(f"\n== {checks} checks, {len(failures)} failures ==")
     if failures:

@@ -14,7 +14,10 @@ from app.geometry import (
     MAX_POINT_COUNT,
     PolygonError,
     classify,
+    nearest_edge,
     prepare_polygon,
+    segment_distance2,
+    within_exclusion_margin,
 )
 
 
@@ -263,3 +266,95 @@ def test_random_polygons_match_exact_reference():
 
 def test_max_point_constant_is_500():
     assert MAX_POINT_COUNT == 500
+
+
+# ---------------------------------------------------------------------------
+# 安全距离：点到线段的整数平方距离
+# ---------------------------------------------------------------------------
+
+def test_segment_distance2_perpendicular_interior_foot():
+    # 垂足落在线段内：平方距离 = cross² / |AB|²，按未约分形式返回。
+    assert segment_distance2(5, 3, 0, 0, 10, 0) == (900, 100)  # 即 9
+    # 斜线段上的真分数：dist² = 9/10。
+    assert segment_distance2(0, 1, 0, 0, 3, 1) == (9, 10)
+
+
+def test_segment_distance2_clamps_to_endpoints():
+    assert segment_distance2(-4, 3, 0, 0, 10, 0) == (25, 1)   # 垂足在 A 外 -> 端点 A
+    assert segment_distance2(14, 3, 0, 0, 10, 0) == (25, 1)   # 垂足在 B 外 -> 端点 B
+    assert segment_distance2(0, 0, 0, 0, 10, 0) == (0, 1)     # 端点上距离为 0
+
+
+def test_nearest_edge_picks_segment_and_reduces_fraction():
+    poly = prepare_polygon(SQUARE_CCW)
+    near = nearest_edge(poly, 5, -3)
+    assert (near.edge_index, near.dist2_num, near.dist2_den) == (0, 9, 1)
+
+    # 斜边 x+y=10 外侧：dist² = 900/200，证据必须约分为 9/2。
+    tri = prepare_polygon([(0, 0), (10, 0), (0, 10)])
+    near = nearest_edge(tri, 8, 5)
+    assert (near.edge_index, near.dist2_num, near.dist2_den) == (1, 9, 2)
+
+
+def test_nearest_edge_vertex_tie_returns_smallest_index():
+    poly = prepare_polygon(SQUARE_CCW)
+    # (-2,-1) 最近的是顶点 (0,0)：边 0 与边 3 的端点距离同为 sqrt(5)，取最小序号。
+    near = nearest_edge(poly, -2, -1)
+    assert (near.edge_index, near.dist2_num, near.dist2_den) == (0, 5, 1)
+
+
+def test_nearest_edge_orientation_reversal_attributes_same_segment():
+    a = nearest_edge(prepare_polygon(SQUARE_CCW), 5, -3)
+    b = nearest_edge(prepare_polygon(SQUARE_CW), 5, -3)
+    assert (a.dist2_num, a.dist2_den) == (b.dist2_num, b.dist2_den) == (9, 1)
+    # 边序号随顶点顺序变化，但归属的是同一条几何边（底边）。
+    assert (a.edge_index, b.edge_index) == (0, 3)
+    assert SQUARE_CW[3] == (10, 0) and SQUARE_CW[0] == (0, 0)
+
+
+def test_within_exclusion_margin_exact_threshold():
+    near = nearest_edge(prepare_polygon(SQUARE_CCW), 5, -3)  # dist² = 9
+    assert within_exclusion_margin(near, 3)        # 距离恰等于阈值 -> 命中
+    assert not within_exclusion_margin(near, 2)    # 刚越过阈值 -> 放行
+    # 分数距离 dist² = 9/2：margin=2 -> 4 < 4.5 不命中；margin=3 -> 9 >= 4.5 命中。
+    tri_near = nearest_edge(prepare_polygon([(0, 0), (10, 0), (0, 10)]), 8, 5)
+    assert not within_exclusion_margin(tri_near, 2)
+    assert within_exclusion_margin(tri_near, 3)
+
+
+def reference_segment_dist2(px, py, ax, ay, bx, by):
+    """Fraction 精确参照：点到线段的最短平方距离。"""
+    dx, dy = bx - ax, by - ay
+    len2 = dx * dx + dy * dy
+    t = Fraction((px - ax) * dx + (py - ay) * dy, len2)
+    if t <= 0:
+        return Fraction((px - ax) ** 2 + (py - ay) ** 2)
+    if t >= 1:
+        return Fraction((px - bx) ** 2 + (py - by) ** 2)
+    qx = ax + t * dx  # 垂足
+    qy = ay + t * dy
+    return (px - qx) ** 2 + (py - qy) ** 2
+
+
+def test_random_nearest_edge_matches_fraction_reference():
+    rng = random.Random(20260914)
+    checked = 0
+    for _ in range(300):
+        pts = random_star_polygon(rng)
+        if pts is None:
+            continue
+        poly = prepare_polygon(pts)
+        m = len(pts)
+        probes = [(rng.randint(-160, 160), rng.randint(-160, 160)) for _ in range(30)]
+        for px, py in probes:
+            dists = [
+                reference_segment_dist2(px, py, *pts[i], *pts[(i + 1) % m])
+                for i in range(m)
+            ]
+            best = min(dists)
+            want_idx = dists.index(best)  # 首个最小值 <=> 同距取最小边序号
+            near = nearest_edge(poly, px, py)
+            assert near.edge_index == want_idx, f"{pts} point={(px,py)}"
+            assert Fraction(near.dist2_num, near.dist2_den) == best
+            checked += 1
+    assert checked > 1000

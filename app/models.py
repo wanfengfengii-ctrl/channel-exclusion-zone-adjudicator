@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from .geometry import COORD_LIMIT, MAX_POINT_COUNT, MAX_VERTEX_COUNT
 
 Decision = Literal["FORBIDDEN", "ALLOWED"]
-ClassificationKind = Literal["INSIDE", "OUTSIDE", "BOUNDARY"]
+ClassificationKind = Literal["INSIDE", "OUTSIDE", "BOUNDARY", "NEAR_BOUNDARY"]
 
 
 class PointModel(BaseModel):
@@ -30,6 +30,16 @@ class RegionModel(BaseModel):
 class AdjudicateRequest(BaseModel):
     region: RegionModel
     points: list[PointModel] = Field(max_length=MAX_POINT_COUNT)
+    # 可选安全距离（整数厘米）。strict：与坐标同样的严格整数规则——布尔、
+    # 数字字符串、5.0 这类浮点一律拒绝；负数或超过坐标上限同样整单 422。
+    # 缺省或传 0 时行为与旧接口完全一致。
+    exclusion_margin_cm: int = Field(
+        default=0,
+        strict=True,
+        ge=0,
+        le=COORD_LIMIT,
+        description="可选安全距离：外部点距任一边不超过该值时改判 FORBIDDEN/NEAR_BOUNDARY",
+    )
 
 
 class PointResult(BaseModel):

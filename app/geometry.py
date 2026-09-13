@@ -3,7 +3,8 @@
 坐标单位为整数厘米；Python 整数为任意精度，在文档允许的坐标范围内
 （绝对值 <= 100_000_000）不存在溢出或舍入问题。本模块不调用任何空间
 数据库或第三方几何库，所有判定（方向、跨立、点在线段上、线段相交、
-水平射线奇偶）均由整数叉积与区间比较直接给出。
+水平射线奇偶、点到线段最短距离）均由整数叉积、点积与平方距离分数
+比较直接给出，全程无浮点。
 
 分类约定：
 * 点严格在多边形内部 -> ``INSIDE``
@@ -12,9 +13,15 @@
 
 边界点一律 FORBIDDEN；点同时命中多条边（即顶点）时，取序号最小的边。
 边序号从 0 开始，闭合边为最后一个不同顶点到第 0 个顶点。
+
+安全距离（exclusion_margin_cm）支持由 ``nearest_edge`` 与
+``within_exclusion_margin`` 提供：外部点距最近边的距离不超过安全
+距离时，HTTP 层将其改判为 NEAR_BOUNDARY；证据中的平方距离以约分
+分数（分子/分母）给出，最近距离相同取最小边序号。
 """
 
 from dataclasses import dataclass
+from math import gcd
 
 COORD_LIMIT = 100_000_000
 MIN_VERTEX_COUNT = 3
@@ -285,3 +292,69 @@ def classify(poly: Polygon, px: int, py: int) -> Classification:
     crossed = tuple(horizontal_ray_edges(poly, px, py))
     kind = "INSIDE" if len(crossed) % 2 == 1 else "OUTSIDE"
     return Classification(kind=kind, boundary_edge=None, crossing_edges=crossed)
+
+
+# ---------------------------------------------------------------------------
+# 安全距离：点到最近边的整数平方距离
+# ---------------------------------------------------------------------------
+
+def segment_distance2(
+    px: int, py: int, ax: int, ay: int, bx: int, by: int
+) -> tuple[int, int]:
+    """点 P 到线段 AB 的最短平方距离，返回未约分的 ``(分子, 分母)``。
+
+    垂足参数 t = ((P-A)·(B-A)) / |B-A|²（点积与平方长度均为整数）：
+    * t <= 0：最近点为端点 A，返回 (|P-A|², 1)；
+    * t >= 1：最近点为端点 B，返回 (|P-B|², 1)；
+    * 0 < t < 1：最近点为垂足，平方距离 = cross(A,B,P)² / |B-A|²。
+
+    分子、分母均为非负整数；两个这样的分数比较大小用交叉相乘完成，
+    不引入浮点。
+    """
+
+    dx = bx - ax
+    dy = by - ay
+    len2 = dx * dx + dy * dy
+    t_num = (px - ax) * dx + (py - ay) * dy
+    if t_num <= 0:
+        return (px - ax) * (px - ax) + (py - ay) * (py - ay), 1
+    if t_num >= len2:
+        return (px - bx) * (px - bx) + (py - by) * (py - by), 1
+    cr = cross(ax, ay, bx, by, px, py)
+    return cr * cr, len2
+
+
+@dataclass(frozen=True)
+class NearestEdge:
+    """点到多边形边界的最短距离证据；平方距离以约分后的分数给出。"""
+
+    edge_index: int
+    dist2_num: int  # 最短平方距离的分子（已约分）
+    dist2_den: int  # 最短平方距离的分母（已约分）
+
+
+def nearest_edge(poly: Polygon, px: int, py: int) -> NearestEdge:
+    """返回距 P 最近的边及最短平方距离（约分后的分子/分母）。
+
+    按边序号升序扫描，仅在严格更小时更新最佳值（交叉相乘比较分数），
+    因此最近距离相同——例如顶点两侧的两条邻边端点距离相等——时
+    自然保留最小边序号。
+    """
+
+    best_i = -1
+    best_num = best_den = 0
+    for i in range(poly.edge_count):
+        (ax, ay), (bx, by) = poly.edge(i)
+        num, den = segment_distance2(px, py, ax, ay, bx, by)
+        if best_i < 0 or num * best_den < best_num * den:
+            best_i, best_num, best_den = i, num, den
+    g = gcd(best_num, best_den)
+    return NearestEdge(
+        edge_index=best_i, dist2_num=best_num // g, dist2_den=best_den // g
+    )
+
+
+def within_exclusion_margin(near: NearestEdge, margin_cm: int) -> bool:
+    """最短距离不超过安全距离的精确整数判定：num/den <= margin²。"""
+
+    return near.dist2_num <= margin_cm * margin_cm * near.dist2_den
