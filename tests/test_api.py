@@ -30,7 +30,9 @@ def post_margin(region, points, margin):
 
 
 SQUARE = [(0, 0), (10, 0), (10, 10), (0, 10)]
-SQUARE_CW = [(0, 0), (0, 10), (10, 10), (10, 0)]
+# CW 变体取顶点序列的反转（与 scripts/acceptance.py 一致）；顶点等距平局按
+# 最小边序号归因，锚点不同的编号方案会得到不同的边序号，因此这里不循环平移锚点。
+SQUARE_CW = list(reversed(SQUARE))
 
 
 def test_basic_decisions_preserve_input_order():
@@ -244,7 +246,21 @@ def test_margin_orientation_reversal_edge_attribution_stable():
             rb["evidence"]["distance2_num"], rb["evidence"]["distance2_den"]
         )
     assert a[0]["evidence"]["edge_index"] == 0
-    assert b[0]["evidence"]["edge_index"] == 3
+    # 反转后的顶点序列为 [(0,10),(10,10),(10,0),(0,0)]，底边序号为 2。
+    assert b[0]["evidence"]["edge_index"] == 2
+
+
+def test_margin_vertex_tie_follows_smallest_index_legacy_rule():
+    # 旧版本行为锁定：顶点等距区（(-2,-1) 到顶点 (0,0) 两侧邻边同为 sqrt(5)）
+    # 一律取最小边序号。锚在 (0,0) 的 CW 区域左边为边 0，归到左边而非底边——
+    # 未提交许可口袋时响应必须与原版本完全一致。
+    cw_anchored = [(0, 0), (0, 10), (10, 10), (10, 0)]
+    r = post_margin(cw_anchored, [{"x": -2, "y": -1}], 5)
+    item = r.json()["results"][0]
+    assert item["classification"] == "NEAR_BOUNDARY"
+    assert item["evidence"]["edge_index"] == 0
+    assert item["evidence"]["edge"] == [[0, 0], [0, 10]]
+    assert (item["evidence"]["distance2_num"], item["evidence"]["distance2_den"]) == (5, 1)
 
 
 @pytest.mark.parametrize("bad", [-1, -100, 1.5, 5.0, "3", True, False, 100_000_001])

@@ -303,21 +303,17 @@ def test_nearest_edge_picks_segment_and_reduces_fraction():
 
 def test_nearest_edge_vertex_tie_returns_smallest_index():
     poly = prepare_polygon(SQUARE_CCW)
-    # (-2,-1) 最近的是顶点 (0,0)：边 0 与边 3 的端点距离同为 sqrt(5)，
-    # 到底边所在直线 y=0 的垂直距离（1）小于到左边所在直线 x=0 的距离（2），
-    # 归到底边——恰也是最小序号。
+    # (-2,-1) 最近的是顶点 (0,0)：边 0 与边 3 的端点距离同为 sqrt(5)，取最小序号。
     near = nearest_edge(poly, -2, -1)
     assert (near.edge_index, near.dist2_num, near.dist2_den) == (0, 5, 1)
 
 
-def test_nearest_edge_vertex_tie_is_orientation_invariant():
-    # 同一几何正方形顺/逆时针（CW 锚在 (0,0)，底边序号为 3）：顶点平局
-    # 必须归到同一条几何边（底边），不受顶点编号影响。
-    a = nearest_edge(prepare_polygon(SQUARE_CCW), -2, -1)
-    b = nearest_edge(prepare_polygon(SQUARE_CW), -2, -1)
-    assert (a.dist2_num, a.dist2_den) == (b.dist2_num, b.dist2_den) == (5, 1)
-    assert (a.edge_index, b.edge_index) == (0, 3)
-    assert {SQUARE_CCW[0], SQUARE_CCW[1]} == {SQUARE_CW[3], SQUARE_CW[0]} == {(0, 0), (10, 0)}
+def test_nearest_edge_vertex_tie_follows_smallest_index_when_renumbered():
+    # 旧版本行为锁定：顶点等距平局一律取最小边序号。SQUARE_CW 锚在 (0,0)，
+    # 左边成为边 0，归因跟随顶点编号（底边在 CW 下序号为 3，不参与平局裁决）。
+    near = nearest_edge(prepare_polygon(SQUARE_CW), -2, -1)
+    assert (near.edge_index, near.dist2_num, near.dist2_den) == (0, 5, 1)
+    assert SQUARE_CW[0] == (0, 0) and SQUARE_CW[1] == (0, 10)  # 边 0 是左边
 
 
 def test_nearest_edge_orientation_reversal_attributes_same_segment():
@@ -364,19 +360,15 @@ def test_random_nearest_edge_matches_fraction_reference():
         m = len(pts)
         probes = [(rng.randint(-160, 160), rng.randint(-160, 160)) for _ in range(30)]
         for px, py in probes:
-            keys = []
-            for i in range(m):
-                ax, ay = pts[i]
-                bx, by = pts[(i + 1) % m]
-                d2 = reference_segment_dist2(px, py, ax, ay, bx, by)
-                # 次键：到边所在直线的垂直平方距离（顺/逆时针不变的几何量）。
-                cr = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
-                perp2 = Fraction(cr * cr, (bx - ax) ** 2 + (by - ay) ** 2)
-                keys.append((d2, perp2, i))
-            want_d2, _, want_idx = min(keys)  # 同距先比垂直距离，再取最小边序号
+            dists = [
+                reference_segment_dist2(px, py, *pts[i], *pts[(i + 1) % m])
+                for i in range(m)
+            ]
+            best = min(dists)
+            want_idx = dists.index(best)  # 首个最小值 <=> 同距取最小边序号
             near = nearest_edge(poly, px, py)
             assert near.edge_index == want_idx, f"{pts} point={(px,py)}"
-            assert Fraction(near.dist2_num, near.dist2_den) == want_d2
+            assert Fraction(near.dist2_num, near.dist2_den) == best
             checked += 1
     assert checked > 1000
 

@@ -17,7 +17,7 @@
 安全距离（exclusion_margin_cm）支持由 ``nearest_edge`` 与
 ``within_exclusion_margin`` 提供：外部点距最近边的距离不超过安全
 距离时，HTTP 层将其改判为 NEAR_BOUNDARY；证据中的平方距离以约分
-分数（分子/分母）给出。
+分数（分子/分母）给出，最近距离相同取最小边序号。
 
 许可口袋（permitted_pockets）由 ``prepare_pockets`` 规整与校验：
 数量上限、单口袋拓扑（沿用区域全部顶点规则）、外环与全部口袋的
@@ -344,37 +344,18 @@ class NearestEdge:
 def nearest_edge(poly: Polygon, px: int, py: int) -> NearestEdge:
     """返回距 P 最近的边及最短平方距离（约分后的分子/分母）。
 
-    逐级平局规则（全程整数交叉相乘比较，无浮点）：
-    1. 主键为夹取后的最短平方距离，仅在严格更小时更新；
-    2. 距离相同（典型情形：P 位于某顶点的外侧夹角区，到两条邻边
-       的最短距离都等于到该顶点的距离）时，取到边所在直线的垂直
-       平方距离更小者——这是与顶点编号无关的几何量，保证顺/逆
-       时针区域把同一点归因到同一条几何边；
-    3. 仍相同（如顶点角平分线上的点，几何上无法区分）时保留
-       先扫描到的边，即最小边序号。
+    按边序号升序扫描，仅在严格更小时更新最佳值（交叉相乘比较分数），
+    因此最近距离相同——例如顶点两侧的两条邻边端点距离相等——时
+    自然保留最小边序号。
     """
 
     best_i = -1
     best_num = best_den = 0
-    best_perp_num = best_perp_den = 0
     for i in range(poly.edge_count):
         (ax, ay), (bx, by) = poly.edge(i)
         num, den = segment_distance2(px, py, ax, ay, bx, by)
-        cr = cross(ax, ay, bx, by, px, py)
-        perp_num = cr * cr
-        perp_den = (bx - ax) * (bx - ax) + (by - ay) * (by - ay)
-        if best_i < 0:
-            take = True
-        else:
-            lhs, rhs = num * best_den, best_num * den
-            if lhs != rhs:
-                take = lhs < rhs
-            else:
-                # 距离并列：垂直距离更小者胜；仍并列则保留最小边序号。
-                take = perp_num * best_perp_den < best_perp_num * perp_den
-        if take:
+        if best_i < 0 or num * best_den < best_num * den:
             best_i, best_num, best_den = i, num, den
-            best_perp_num, best_perp_den = perp_num, perp_den
     g = gcd(best_num, best_den)
     return NearestEdge(
         edge_index=best_i, dist2_num=best_num // g, dist2_den=best_den // g
