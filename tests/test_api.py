@@ -262,3 +262,88 @@ def test_margin_at_coordinate_limit_accepted():
     r = post_margin(SQUARE, [{"x": 20, "y": 20}], 100_000_000)
     assert r.status_code == 200
     assert r.json()["results"][0]["classification"] == "NEAR_BOUNDARY"
+
+
+# ---------------------------------------------------------------------------
+# 未声明字段：任何层级都必须整单 422，禁止静默丢弃后按默认值裁决
+# ---------------------------------------------------------------------------
+
+def _issues(body):
+    return body["error"]["details"]["issues"]
+
+
+def _locs(body):
+    return [tuple(issue["loc"]) for issue in _issues(body)]
+
+
+def test_misspelled_margin_field_rejected_instead_of_zero_margin():
+    # 近边外部点在 3cm 安全距离下本应改判 FORBIDDEN；误拼字段名时
+    # 不得静默按缺省 0 裁决并放行，必须整单校验失败。
+    r = client.post(
+        "/adjudicate",
+        json={
+            "region": {"vertices": [{"x": x, "y": y} for x, y in SQUARE]},
+            "points": [{"x": 5, "y": -3}],
+            "exclushun_margin_cm": 3,
+        },
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "VALIDATION_ERROR"
+    assert "results" not in body
+    assert ("body", "exclushun_margin_cm") in _locs(body)
+    assert all(
+        issue.get("type") == "extra_forbidden" and issue["loc"][-1] == "exclushun_margin_cm"
+        for issue in _issues(body)
+    )
+
+
+def test_undeclared_coordinate_field_on_point_rejects_whole_order():
+    r = client.post(
+        "/adjudicate",
+        json={
+            "region": {"vertices": [{"x": x, "y": y} for x, y in SQUARE]},
+            "points": [{"x": 1, "y": 1}, {"x": 5, "y": -3, "z": 1}],
+        },
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "VALIDATION_ERROR"
+    assert "results" not in body
+    # 错误定位到具体待判点的未声明字段。
+    assert ("body", "points", 1, "z") in _locs(body)
+
+
+def test_undeclared_field_on_region_rejects_and_locates_region_field():
+    r = client.post(
+        "/adjudicate",
+        json={
+            "region": {
+                "vertices": [{"x": x, "y": y} for x, y in SQUARE],
+                "zone_code": "D-07",
+            },
+            "points": [{"x": 1, "y": 1}],
+        },
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "VALIDATION_ERROR"
+    assert "results" not in body
+    assert ("body", "region", "zone_code") in _locs(body)
+
+
+def test_undeclared_field_on_region_vertex_rejected():
+    r = client.post(
+        "/adjudicate",
+        json={
+            "region": {"vertices": [
+                {"x": 0, "y": 0, "elevation": 0},
+                {"x": 10, "y": 0}, {"x": 10, "y": 10}, {"x": 0, "y": 10},
+            ]},
+            "points": [],
+        },
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "VALIDATION_ERROR"
+    assert ("body", "region", "vertices", 0, "elevation") in _locs(body)
