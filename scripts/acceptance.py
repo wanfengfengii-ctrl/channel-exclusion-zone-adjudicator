@@ -186,6 +186,22 @@ def main() -> int:
     status, body = call(square, [(10**9, 0)], expect_status=422)
     check("坐标越界 422", status == 422 and body["error"]["code"] == "VALIDATION_ERROR", str(body)[:200])
 
+    # 布尔值、数字字符串、整数形式的浮点都不得被当作整数受理：直接发原始 JSON。
+    for label, bad_json in (("布尔", "true"), ("数字字符串", '"5"'), ("整数浮点", "5.0")):
+        raw = (
+            '{"region":{"vertices":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":10},{"x":0,"y":10}]},'
+            f'"points":[{{"x":{bad_json},"y":0}}]}}'
+        ).encode()
+        req = urllib.request.Request(URL, data=raw, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                status, body = resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            status, body = exc.code, json.loads(exc.read())
+        check(f"非整数坐标（{label}）整单 422 且无结果",
+              status == 422 and body["error"]["code"] == "VALIDATION_ERROR" and "results" not in body,
+              f"{status} {str(body)[:200]}")
+
     # --- 5. 顺序保持与 500 点上限 ------------------------------------------
     print("[5] 顺序保持与 500 点上限")
     many = [((i * 7919) % 13 - 2, (i * 6151) % 11 - 2) for i in range(500)]

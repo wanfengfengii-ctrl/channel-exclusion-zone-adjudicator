@@ -16,8 +16,10 @@ ClassificationKind = Literal["INSIDE", "OUTSIDE", "BOUNDARY"]
 
 
 class PointModel(BaseModel):
-    x: int = Field(ge=-COORD_LIMIT, le=COORD_LIMIT, description="整数厘米 X 坐标")
-    y: int = Field(ge=-COORD_LIMIT, le=COORD_LIMIT, description="整数厘米 Y 坐标")
+    # strict：只接受真正的整数。布尔值（JSON true/false 会被 Python 解析为 bool，
+    # 而 bool 是 int 的子类）、数字字符串、5.0 这类浮点值一律拒绝，整单 422。
+    x: int = Field(strict=True, ge=-COORD_LIMIT, le=COORD_LIMIT, description="整数厘米 X 坐标")
+    y: int = Field(strict=True, ge=-COORD_LIMIT, le=COORD_LIMIT, description="整数厘米 Y 坐标")
 
 
 class RegionModel(BaseModel):

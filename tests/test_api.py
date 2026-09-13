@@ -111,9 +111,31 @@ def test_too_many_points_rejected():
 
 
 def test_non_integer_coordinates_rejected():
-    r = post(SQUARE, [{"x": 1.5, "y": 0}])
-    assert r.status_code == 422
-    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+    # 布尔值、数字字符串、浮点（即便数值为整数 5.0）都不得被当成整数裁决。
+    for bad in (True, False, "5", "5.0", 5.0, 1.5):
+        r = post(SQUARE, [{"x": bad, "y": 0}])
+        assert r.status_code == 422, bad
+        body = r.json()
+        assert body["error"]["code"] == "VALIDATION_ERROR", bad
+        assert "results" not in body, bad
+
+    # 区域顶点同样适用严格整数。
+    for bad in (True, "10", 10.0):
+        r = client.post(
+            "/adjudicate",
+            json={
+                "region": {"vertices": [
+                    {"x": 0, "y": 0}, {"x": bad, "y": 0},
+                    {"x": 10, "y": 10}, {"x": 0, "y": 10},
+                ]},
+                "points": [{"x": 1, "y": 1}],
+            },
+        )
+        assert r.status_code == 422, bad
+        assert r.json()["error"]["code"] == "VALIDATION_ERROR", bad
+
+    # 真正的整数必须正常受理（边界值另行由范围测试覆盖）。
+    assert post(SQUARE, [{"x": -1, "y": 0}, {"x": 0, "y": 0}]).status_code == 200
 
 
 def test_empty_points_allowed():
