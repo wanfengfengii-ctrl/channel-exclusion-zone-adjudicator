@@ -82,3 +82,28 @@ class PolygonSummary(BaseModel):
 class AdjudicateResponse(BaseModel):
     polygon: PolygonSummary
     results: list[PointResult]
+
+
+class RegionAreaSummaryRequest(StrictRequestModel):
+    """面积汇总请求：与裁决一致的 region 与可选 permitted_pockets。
+
+    不接收待判点（points）与安全距离（exclusion_margin_cm）——本接口只做
+    面积核对；未声明字段由 extra="forbid" 整单 422 拒绝。
+    """
+
+    region: RegionModel
+    permitted_pockets: list[PocketModel] | None = Field(
+        default=None,
+        description="可选许可口袋：与裁决接口相同的拓扑校验，最多 10 个",
+    )
+
+
+class PocketAreaSummary(BaseModel):
+    pocket_index: int
+    area2: int = Field(description="该口袋的绝对二倍面积（平方厘米的二倍）")
+
+
+class RegionAreaSummaryResponse(BaseModel):
+    region_area2: int = Field(description="外环（禁抛区）的绝对二倍面积")
+    pockets: list[PocketAreaSummary]
+    net_area2: int = Field(description="扣除全部口袋后的二倍面积：region_area2 - sum(pockets.area2)")

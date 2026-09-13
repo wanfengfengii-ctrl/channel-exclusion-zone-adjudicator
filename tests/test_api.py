@@ -567,3 +567,129 @@ def test_pocket_vertex_rules_match_region_rules():
         r_bad = post_pockets(BIG, [], [[(10, 10), (20, 10), (bad, 20), (10, 20)]])
         assert r_bad.status_code == 422, bad
         assert r_bad.json()["error"]["code"] == "VALIDATION_ERROR", bad
+
+
+# ---------------------------------------------------------------------------
+# POST /region-area-summary 面积汇总
+# ---------------------------------------------------------------------------
+
+def post_summary(region, pockets=None, **extra):
+    payload = {"region": {"vertices": [{"x": x, "y": y} for x, y in region]}}
+    if pockets is not None:
+        payload["permitted_pockets"] = [
+            {"vertices": [{"x": x, "y": y} for x, y in pocket]} for pocket in pockets
+        ]
+    payload.update(extra)
+    return client.post("/region-area-summary", json=payload)
+
+
+def test_area_summary_rectangle_with_two_pockets_conserves_area():
+    r = post_summary(BIG, pockets=[POCKET_A, POCKET_B])
+    assert r.status_code == 200
+    data = r.json()
+    assert data["region_area2"] == 20000  # 100cm x 100cm 的二倍
+    # 各口袋按输入顺序携带 pocket_index，面积为各自绝对二倍面积。
+    assert data["pockets"] == [
+        {"pocket_index": 0, "area2": 200},
+        {"pocket_index": 1, "area2": 200},
+    ]
+    # 面积守恒：汇总值 = 外环绝对二倍面积 - 全部口袋绝对二倍面积。
+    assert data["net_area2"] == 20000 - 200 - 200 == 19600
+    assert data["net_area2"] == data["region_area2"] - sum(p["area2"] for p in data["pockets"])
+
+
+def test_area_summary_orientation_and_closing_point_invariant():
+    # 顺/逆时针与末尾重复闭合点写法（区域与口袋同时变体）给出完全一致的响应。
+    base = post_summary(BIG, pockets=[POCKET_A, POCKET_B]).json()
+    cw = post_summary(list(reversed(BIG)),
+                      pockets=[list(reversed(POCKET_A)), list(reversed(POCKET_B))]).json()
+    closed = post_summary(BIG + [BIG[0]],
+                          pockets=[POCKET_A + [POCKET_A[0]], POCKET_B + [POCKET_B[0]]]).json()
+    assert base == cw == closed
+
+
+def test_area_summary_without_pockets_defaults():
+    # 缺省、显式 null、空列表均视为无口袋：汇总值等于外环面积。
+    r_null = post_summary(BIG, permitted_pockets=None)
+    for r in (post_summary(BIG), post_summary(BIG, pockets=[]), r_null):
+        assert r.status_code == 200
+        data = r.json()
+        assert data["region_area2"] == 20000
+        assert data["pockets"] == []
+        assert data["net_area2"] == data["region_area2"]
+
+
+def test_area_summary_large_coordinates_exact():
+    B = 100_000_000
+    r = post_summary([(-B, -B), (B, -B), (B, B), (-B, B)])
+    assert r.status_code == 200
+    assert r.json()["region_area2"] == 2 * (2 * B) * (2 * B)  # 8e16，整数精确
+
+
+def test_area_summary_invalid_region_422_envelope():
+    r = post_summary([(0, 0), (10, 10), (10, 0), (0, 8)])
+    assert r.status_code == 422
+    body = r.json()
+    assert set(body) == {"error"}
+    assert body["error"]["code"] == "SELF_INTERSECTING_POLYGON"
+
+
+def test_area_summary_invalid_pocket_rejected_and_located():
+    # 第二个口袋为蝴蝶结：整单 422，details 精确定位到口袋序号。
+    bowtie = [(40, 40), (50, 50), (50, 40), (40, 48)]
+    r = post_summary(BIG, pockets=[POCKET_A, bowtie])
+    assert r.status_code == 422
+    body = r.json()
+    assert set(body) == {"error"}
+    assert body["error"]["code"] == "SELF_INTERSECTING_POLYGON"
+    assert body["error"]["details"]["pocket_index"] == 1
+
+    # 口袋越出禁抛区：POCKET_NOT_INSIDE_REGION 并给出口袋序号。
+    r = post_summary(BIG, pockets=[[(90, 90), (110, 90), (110, 110), (90, 110)]])
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "POCKET_NOT_INSIDE_REGION"
+    assert body["error"]["details"]["pocket_index"] == 0
+
+    # 口袋两两接触：POCKETS_INTERSECT 并给出两个口袋序号。
+    touching = [(20, 10), (30, 10), (30, 20), (20, 20)]
+    r = post_summary(BIG, pockets=[POCKET_A, touching])
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "POCKETS_INTERSECT"
+    assert body["error"]["details"]["pocket_indices"] == [0, 1]
+
+
+def test_area_summary_count_limits_rejected():
+    # 11 个口袋：TOO_MANY_POCKETS 并给出计数。
+    eleven = [[(10 + 8 * k, 10), (16 + 8 * k, 10), (16 + 8 * k, 16), (10 + 8 * k, 16)]
+              for k in range(11)]
+    r = post_summary(BIG, pockets=eleven)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "TOO_MANY_POCKETS"
+    assert body["error"]["details"]["pocket_count"] == 11
+
+    # 外环与口袋总顶点 504 > 500：TOO_MANY_TOTAL_VERTICES 并给出总计数。
+    region = [(0, 0), (40000, 0), (40000, 5000), (0, 5000)]
+    pockets = [ngon(50, 2000 + 3000 * k, 2500, 1000) for k in range(10)]
+    r = post_summary(region, pockets=pockets)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "TOO_MANY_TOTAL_VERTICES"
+    assert body["error"]["details"]["total_vertex_count"] == 504
+
+
+def test_area_summary_rejects_points_and_margin_fields():
+    # 本接口不接收待判点与安全距离：未声明字段整单 422 并精确定位。
+    r = post_summary(BIG, points=[{"x": 1, "y": 1}])
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "VALIDATION_ERROR"
+    assert ("body", "points") in _locs(body)
+
+    r = post_summary(BIG, exclusion_margin_cm=3)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "VALIDATION_ERROR"
+    assert ("body", "exclusion_margin_cm") in _locs(body)

@@ -4,7 +4,8 @@
 只使用标准库；期望不是照抄服务实现，而是来自：
 * 方向反转 / 闭合写法之间的响应互相对比（同一点必须同结论）；
 * 独立的整数叉积与最小相邻边序号推导；
-* 对非法区域只要求“显式错误信封 + 无部分结果”。
+* 对非法区域只要求“显式错误信封 + 无部分结果”；
+* 面积汇总接口的矩形外环 + 双口袋面积守恒核对（鞋带公式手算值）。
 
 任一检查不过即以非零码退出。
 """
@@ -19,6 +20,7 @@ import urllib.request
 
 API = os.environ.get("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 URL = f"{API}/adjudicate"
+SUMMARY_URL = f"{API}/region-area-summary"
 
 failures: list[str] = []
 checks = 0
@@ -47,6 +49,28 @@ def call(vertices, points, *, margin=None, pockets=None, expect_status=200):
         ]
     body = json.dumps(payload).encode()
     req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        payload = json.loads(exc.read())
+        if expect_status != exc.code:
+            raise AssertionError(f"expected {expect_status}, got {exc.code}: {payload}")
+        return exc.code, payload
+
+
+def call_summary(vertices, *, pockets=None, extra=None, expect_status=200):
+    """调用 POST /region-area-summary；pockets=None 表示不提交该字段。"""
+
+    payload = {"region": {"vertices": [{"x": x, "y": y} for x, y in vertices]}}
+    if pockets is not None:
+        payload["permitted_pockets"] = [
+            {"vertices": [{"x": x, "y": y} for x, y in pocket]} for pocket in pockets
+        ]
+    if extra:
+        payload.update(extra)
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(SUMMARY_URL, data=body, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, json.loads(resp.read())
@@ -433,6 +457,76 @@ def main() -> int:
     check("空口袋列表与未提交字段响应完全一致",
           body_missing == body_empty
           and all(r["classification"] != "PERMITTED_POCKET" for r in body_missing["results"]))
+
+    # --- 9. POST /region-area-summary 面积汇总 -------------------------------
+    print("[9] POST /region-area-summary 面积汇总")
+
+    # 矩形外环 + 两个口袋：核对面积守恒（汇总值 = 外环 - 全部口袋）。
+    _, summary = call_summary(big, pockets=[pa, pb])
+    check("矩形外环与两个口袋的二倍面积逐项正确",
+          summary.get("region_area2") == 20000
+          and summary.get("pockets") == [{"pocket_index": 0, "area2": 200},
+                                         {"pocket_index": 1, "area2": 200}],
+          json.dumps(summary, ensure_ascii=False))
+    check("面积守恒：net = 外环绝对二倍面积 - 全部口袋绝对二倍面积",
+          summary.get("net_area2") == 20000 - 200 - 200
+          and summary.get("net_area2")
+          == summary.get("region_area2") - sum(p["area2"] for p in summary.get("pockets", [])),
+          json.dumps(summary, ensure_ascii=False))
+
+    # 顺/逆时针与末尾重复闭合点写法（区域与口袋同时变体）结果完全一致。
+    _, summary_cw = call_summary(list(reversed(big)),
+                                 pockets=[list(reversed(pa)), list(reversed(pb))])
+    _, summary_closed = call_summary(big + [big[0]],
+                                     pockets=[pa + [pa[0]], pb + [pb[0]]])
+    check("顺/逆时针面积汇总结果一致", summary == summary_cw,
+          json.dumps([summary, summary_cw], ensure_ascii=False))
+    check("省略/重写首点面积汇总结果一致", summary == summary_closed,
+          json.dumps([summary, summary_closed], ensure_ascii=False))
+
+    # 未提交口袋：汇总值等于外环面积，口袋列表为空。
+    _, summary_none = call_summary(big)
+    _, summary_empty = call_summary(big, pockets=[])
+    check("无口袋时 net 等于外环面积且口袋列表为空",
+          summary_none == summary_empty
+          and summary_none.get("pockets") == []
+          and summary_none.get("net_area2") == summary_none.get("region_area2") == 20000,
+          json.dumps(summary_none, ensure_ascii=False))
+
+    # 非法口袋：整单 422 并保留口袋定位。
+    bowtie = [(40, 40), (50, 50), (50, 40), (40, 48)]
+    status, body = call_summary(big, pockets=[pa, bowtie], expect_status=422)
+    check("自交口袋整单 422 并定位到口袋序号",
+          status == 422 and set(body.keys()) == {"error"}
+          and body["error"]["code"] == "SELF_INTERSECTING_POLYGON"
+          and body["error"]["details"].get("pocket_index") == 1,
+          f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+    status, body = call_summary(big, pockets=[[(90, 90), (110, 90), (110, 110), (90, 110)]],
+                                expect_status=422)
+    check("口袋越出禁抛区整单 422 并定位到口袋序号",
+          status == 422 and body["error"]["code"] == "POCKET_NOT_INSIDE_REGION"
+          and body["error"]["details"].get("pocket_index") == 0,
+          f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+    status, body = call_summary(big, pockets=eleven, expect_status=422)
+    check("11 个口袋整单 422 并给出口袋计数",
+          status == 422 and body["error"]["code"] == "TOO_MANY_POCKETS"
+          and body["error"]["details"].get("pocket_count") == 11,
+          f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+    status, body = call_summary(wide, pockets=over, expect_status=422)
+    check("总顶点超限整单 422 并给出总顶点计数",
+          status == 422 and body["error"]["code"] == "TOO_MANY_TOTAL_VERTICES"
+          and body["error"]["details"].get("total_vertex_count") == 504,
+          f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+
+    # 面积接口不接收待判点与安全距离：未声明字段整单 422。
+    for name, extra in [("points", {"points": [{"x": 1, "y": 1}]}),
+                        ("exclusion_margin_cm", {"exclusion_margin_cm": 3})]:
+        status, body = call_summary(big, extra=extra, expect_status=422)
+        check(f"面积接口拒绝未声明字段 {name}",
+              status == 422 and body["error"]["code"] == "VALIDATION_ERROR"
+              and any(issue.get("loc") == ["body", name]
+                      for issue in body["error"]["details"].get("issues", [])),
+              f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
 
     print(f"\n== {checks} checks, {len(failures)} failures ==")
     if failures:

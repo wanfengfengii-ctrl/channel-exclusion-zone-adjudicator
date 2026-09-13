@@ -24,6 +24,9 @@
 总顶点数、每个口袋严格位于禁抛区内部、口袋两两不接触不重叠；
 ``containing_pocket`` 按输入顺序返回严格包含待判点的第一个口袋
 序号，供 HTTP 层把口袋内部点改判为 ALLOWED。
+
+面积汇总由 ``doubled_area`` 提供：返回多边形绝对二倍面积（整数，
+与顶点方向及闭合写法无关），供 /region-area-summary 核对申报面积。
 """
 
 from dataclasses import dataclass
@@ -120,6 +123,16 @@ def signed_area2(vertices: list[tuple[int, int]]) -> int:
         bx, by = vertices[(i + 1) % m]
         total += ax * by - ay * bx
     return total
+
+
+def doubled_area(poly: "Polygon") -> int:
+    """多边形面积的 2 倍（整数，单位为平方厘米的二倍）。
+
+    取有向二倍面积的绝对值，因此与顶点顺/逆时针方向无关；末尾重复
+    闭合点在规整阶段已被丢弃，同样不影响结果。
+    """
+
+    return abs(poly.signed_area2)
 
 
 # ---------------------------------------------------------------------------

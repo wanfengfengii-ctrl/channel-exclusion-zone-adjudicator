@@ -18,6 +18,7 @@ from app.geometry import (
     PolygonError,
     classify,
     containing_pocket,
+    doubled_area,
     nearest_edge,
     prepare_pockets,
     prepare_polygon,
@@ -505,3 +506,31 @@ def test_pockets_intersect_variants_rejected(second):
         prepare_pockets(region, [POCKET_A, second])
     assert ei.value.code == "POCKETS_INTERSECT"
     assert ei.value.details["pocket_indices"] == [0, 1]
+
+
+# ---------------------------------------------------------------------------
+# 面积汇总：绝对二倍面积
+# ---------------------------------------------------------------------------
+
+def test_doubled_area_orientation_and_closing_point_invariant():
+    a = prepare_polygon(SQUARE_CCW)
+    b = prepare_polygon(list(reversed(SQUARE_CCW)))
+    c = prepare_polygon(SQUARE_CCW + [SQUARE_CCW[0]])
+    assert doubled_area(a) == doubled_area(b) == doubled_area(c) == 200
+    # 有向面积符号随方向翻转，绝对二倍面积不变。
+    assert a.signed_area2 == -b.signed_area2
+
+
+def test_doubled_area_large_coordinates_exact():
+    B = 100_000_000
+    big = prepare_polygon([(-B, -B), (B, -B), (B, B), (-B, B)])
+    assert doubled_area(big) == 2 * (2 * B) * (2 * B)  # 8e16，整数精确
+
+
+def test_doubled_area_net_conservation_with_pockets():
+    region = prepare_polygon(REGION_100)
+    pockets = prepare_pockets(region, [POCKET_A, POCKET_B])
+    net = doubled_area(region) - sum(doubled_area(p) for p in pockets)
+    assert doubled_area(region) == 20000
+    assert [doubled_area(p) for p in pockets] == [200, 200]
+    assert net == 19600

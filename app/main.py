@@ -22,6 +22,18 @@ POST /adjudicate
     安全距离为正时许可范围向口袋内部收缩：口袋内部距口袋边界不超
     过该距离的点继续禁抛，沿用既有精确距离证据并标注口袋序号。
     未提交 permitted_pockets 时请求响应与当前版本完全一致。
+POST /region-area-summary
+    入参::
+
+        {"region": {"vertices": [{"x": .., "y": ..}, ...]},
+         "permitted_pockets": null}     # 可选，缺省为无口袋
+
+    面积核对接口：复用与裁决完全一致的多边形规整与口袋拓扑校验
+    （非法时同一 422 错误信封并保留口袋定位），返回外环、各口袋
+    （按输入顺序携带 pocket_index）与扣除口袋后的面积。面积一律
+    以二倍整数（平方厘米的二倍）给出：汇总值 = 外环绝对二倍面积
+    - 全部口袋绝对二倍面积，与顶点顺/逆时针方向及末尾重复闭合点
+    写法无关。本接口不接收待判点与安全距离。
 GET /healthz
     存活探针，供 Docker Compose 的 verify 服务等待 API 就绪。
 """
@@ -38,17 +50,27 @@ from .geometry import (
     PolygonError,
     classify,
     containing_pocket,
+    doubled_area,
     nearest_edge,
     prepare_pockets,
     prepare_polygon,
     within_exclusion_margin,
 )
-from .models import AdjudicateRequest, AdjudicateResponse, PointModel, PointResult, PolygonSummary
+from .models import (
+    AdjudicateRequest,
+    AdjudicateResponse,
+    PocketAreaSummary,
+    PointModel,
+    PointResult,
+    PolygonSummary,
+    RegionAreaSummaryRequest,
+    RegionAreaSummaryResponse,
+)
 
 app = FastAPI(
     title="Dredging Spoil Dumping Adjudication Service",
-    version="1.2.0",
-    description="纯整数计算几何：判定点位于禁抛区内部、外部还是边界，支持边界安全距离与区内许可口袋。",
+    version="1.3.0",
+    description="纯整数计算几何：判定点位于禁抛区内部、外部还是边界，支持边界安全距离、区内许可口袋与区域面积核对。",
 )
 
 
@@ -130,15 +152,25 @@ def pocket_evidence(pocket_index: int) -> dict:
     }
 
 
+def prepare_region_and_pockets(region_model, pocket_models) -> tuple[Polygon, list[Polygon]]:
+    """规整禁抛区并校验许可口袋，两个接口共用同一链路。
+
+    区域非法或口袋非法时直接抛 PolygonError -> 422，无部分结果；
+    缺省、null 或空列表的 permitted_pockets 均视为无口袋。
+    """
+
+    raw = [[v.x, v.y] for v in region_model.vertices]
+    poly = prepare_polygon(raw)
+    pockets: list[Polygon] = []
+    if pocket_models:
+        raw_pockets = [[[v.x, v.y] for v in pocket.vertices] for pocket in pocket_models]
+        pockets = prepare_pockets(poly, raw_pockets)
+    return poly, pockets
+
+
 @app.post("/adjudicate", response_model=AdjudicateResponse)
 def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
-    raw = [[v.x, v.y] for v in req.region.vertices]
-    poly = prepare_polygon(raw)  # 非法直接抛 PolygonError -> 422，无部分结果
-    # 许可口袋：缺省、null 或空列表时无口袋，行为与旧接口完全一致。
-    pockets: list[Polygon] = []
-    if req.permitted_pockets:
-        raw_pockets = [[[v.x, v.y] for v in pocket.vertices] for pocket in req.permitted_pockets]
-        pockets = prepare_pockets(poly, raw_pockets)  # 任一非法 -> 422，无部分结果
+    poly, pockets = prepare_region_and_pockets(req.region, req.permitted_pockets)
     margin = req.exclusion_margin_cm
 
     results: list[PointResult] = []
@@ -197,6 +229,23 @@ def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
             signed_area2=poly.signed_area2,
         ),
         results=results,
+    )
+
+
+@app.post("/region-area-summary", response_model=RegionAreaSummaryResponse)
+def region_area_summary(req: RegionAreaSummaryRequest) -> RegionAreaSummaryResponse:
+    # 与裁决完全一致的多边形规整与口袋拓扑校验；非法时同一 422 信封。
+    poly, pockets = prepare_region_and_pockets(req.region, req.permitted_pockets)
+    region_area2 = doubled_area(poly)
+    pocket_summaries = [
+        PocketAreaSummary(pocket_index=i, area2=doubled_area(pocket))
+        for i, pocket in enumerate(pockets)
+    ]
+    net_area2 = region_area2 - sum(p.area2 for p in pocket_summaries)
+    return RegionAreaSummaryResponse(
+        region_area2=region_area2,
+        pockets=pocket_summaries,
+        net_area2=net_area2,
     )
 
 
