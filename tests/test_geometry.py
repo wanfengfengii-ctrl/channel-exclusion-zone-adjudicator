@@ -105,6 +105,16 @@ def test_too_many_vertices_rejected():
     assert ei.value.code == "TOO_MANY_VERTICES"
 
 
+def test_too_many_vertices_with_closing_point_rejected_after_normalization():
+    # 201 个不同顶点 + 末尾重复首点：闭合点先被规整丢弃，再按 201 个不同
+    # 顶点裁决超限——不得按 202 条原始条目计数，也不得漏报。
+    pts = [(i, i * i % 7 - 3) for i in range(201)]
+    with pytest.raises(PolygonError) as ei:
+        prepare_polygon(pts + [pts[0]])
+    assert ei.value.code == "TOO_MANY_VERTICES"
+    assert ei.value.details["vertex_count"] == 201
+
+
 def test_bowtie_self_intersection_rejected():
     # 非对称蝴蝶结：有向面积非零，确保由自交规则（而非零面积规则）拒绝。
     bowtie = [(0, 0), (10, 10), (10, 0), (0, 8)]
@@ -427,6 +437,27 @@ def test_too_many_pockets_rejected_with_count():
         prepare_pockets(region, many)
     assert ei.value.code == "TOO_MANY_POCKETS"
     assert ei.value.details["pocket_count"] == 11
+
+
+def test_too_many_pockets_count_checked_before_pocket_topology():
+    # 11 个顶点不足的口袋：整单数量限制必须先于逐口袋顶点校验裁决。
+    region = prepare_polygon(REGION_100)
+    bad = [[(10 + k, 10), (20 + k, 10)] for k in range(11)]
+    with pytest.raises(PolygonError) as ei:
+        prepare_pockets(region, bad)
+    assert ei.value.code == "TOO_MANY_POCKETS"
+    assert ei.value.details["pocket_count"] == 11
+
+
+def test_pocket_too_many_vertices_with_closing_point_carries_index():
+    # 超限口袋（201 个不同顶点 + 末尾闭合）：沿用区域错误码并保留口袋序号。
+    region = prepare_polygon(REGION_100)
+    big = [(i, i * i % 7 - 3) for i in range(201)]
+    with pytest.raises(PolygonError) as ei:
+        prepare_pockets(region, [POCKET_A, big + [big[0]]])
+    assert ei.value.code == "TOO_MANY_VERTICES"
+    assert ei.value.details["pocket_index"] == 1
+    assert ei.value.details["vertex_count"] == 201
 
 
 def test_total_vertex_count_limit_rejected_with_count():

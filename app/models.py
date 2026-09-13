@@ -1,8 +1,14 @@
 """请求/响应模型与校验边界。
 
-数值范围的硬性约束在 Pydantic 层完成；多边形合法性（重复点、零面积、
-自交等）在 ``app.geometry.prepare_polygon`` 中以整数运算裁决，两类错误
-统一以 422 + 显式错误信封返回。
+数值范围的硬性约束在 Pydantic 层完成；多边形合法性（顶点计数、重复点、
+零面积、自交等）在 ``app.geometry.prepare_polygon`` 中以整数运算裁决，
+两类错误统一以 422 + 显式错误信封返回。
+
+顶点计数不在本层设上限：末尾重复首点的闭合写法必须先规整丢弃，再按
+不同顶点数裁决 ``TOO_MANY_VERTICES``——若由本层限制原始条目数，201 个
+不同顶点加闭合点的提交只会得到通用字段错误。口袋的顶点计数（含下限）
+同样全部交由几何层：口袋数量上限（``TOO_MANY_POCKETS``）必须先于逐口袋
+顶点校验裁决，且单口袋顶点错误必须携带口袋序号。
 
 所有请求侧模型继承 ``StrictRequestModel``：``extra="forbid"`` 使顶层、
 区域、顶点与待判点上的任何未声明字段都整单 422，绝不静默丢弃——
@@ -13,7 +19,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .geometry import COORD_LIMIT, MAX_POINT_COUNT, MAX_VERTEX_COUNT
+from .geometry import COORD_LIMIT, MAX_POINT_COUNT
 
 Decision = Literal["FORBIDDEN", "ALLOWED"]
 ClassificationKind = Literal["INSIDE", "OUTSIDE", "BOUNDARY", "NEAR_BOUNDARY", "PERMITTED_POCKET"]
@@ -33,12 +39,22 @@ class PointModel(StrictRequestModel):
 
 
 class RegionModel(StrictRequestModel):
-    # 允许末尾再写一次首点表示闭合，因此原始条目数上限为 201。
-    vertices: list[PointModel] = Field(min_length=3, max_length=MAX_VERTEX_COUNT + 1)
+    # 允许末尾再写一次首点表示闭合。原始条目只约束下限；上限不在此约束——
+    # 末尾闭合点需先在几何层规整丢弃，再按不同顶点数裁决 TOO_MANY_VERTICES，
+    # 否则 201 个不同顶点加闭合点的提交会被误报为通用字段错误。
+    vertices: list[PointModel] = Field(min_length=3)
 
 
 class PocketModel(RegionModel):
-    """许可口袋：顶点规则与禁抛区完全一致（3～200 个不同顶点，允许末尾闭合写法）。"""
+    """许可口袋：顶点规则与禁抛区完全一致（3～200 个不同顶点，允许末尾闭合写法）。
+
+    顶点计数（含下限）不在本层约束，全部交由几何层裁决：口袋数量上限
+    （TOO_MANY_POCKETS）必须先于逐口袋顶点校验，且单口袋顶点错误必须携带
+    口袋序号——若由本层逐口袋校验顶点数，11 个顶点不足的口袋会返回 11 条
+    局部字段错误，掩盖整单超限。
+    """
+
+    vertices: list[PointModel] = Field()
 
 
 class AdjudicateRequest(StrictRequestModel):
@@ -55,9 +71,9 @@ class AdjudicateRequest(StrictRequestModel):
         description="可选安全距离：外部点距任一边不超过该值时改判 FORBIDDEN/NEAR_BOUNDARY",
     )
     # 可选许可口袋列表：每个口袋都是严格位于禁抛区内部、彼此不接触不重叠的
-    # 简单多边形。数量上限（10 个）与外环加全部口袋规整后的总顶点数上限
-    # （500）在几何层校验，分别给出携带计数/序号的显式错误码。缺省、null
-    # 或空列表时行为与旧接口完全一致。
+    # 简单多边形。数量上限（10 个）、单口袋顶点计数与外环加全部口袋规整后的
+    # 总顶点数上限（500）都在几何层校验，分别给出携带计数/序号的显式错误码。
+    # 缺省、null 或空列表时行为与旧接口完全一致。
     permitted_pockets: list[PocketModel] | None = Field(
         default=None,
         description="可选许可口袋：严格位于禁抛区内部、互不接触重叠的简单多边形，最多 10 个",

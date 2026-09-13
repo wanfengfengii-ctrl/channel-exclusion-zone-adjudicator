@@ -693,3 +693,79 @@ def test_area_summary_rejects_points_and_margin_fields():
     body = r.json()
     assert body["error"]["code"] == "VALIDATION_ERROR"
     assert ("body", "exclusion_margin_cm") in _locs(body)
+
+
+# ---------------------------------------------------------------------------
+# 顶点/数量上限：计数校验在几何层按规整后的顶点裁决，不被通用字段错误掩盖
+# ---------------------------------------------------------------------------
+
+def test_region_201_distinct_plus_closing_point_reports_vertex_limit():
+    # 201 个不同顶点 + 末尾重复首点闭合 = 202 条原始条目：不得被通用字段
+    # 错误（too_long）掩盖，必须明确返回外环顶点数量超限。
+    ring = [(i, i * i % 7 - 3) for i in range(201)]
+    closed = ring + [ring[0]]
+    for r in (post(closed, []), post_summary(closed)):
+        assert r.status_code == 422
+        body = r.json()
+        assert set(body) == {"error"}
+        assert body["error"]["code"] == "TOO_MANY_VERTICES"
+        assert body["error"]["details"]["vertex_count"] == 201
+        assert "results" not in body
+
+
+def test_region_200_distinct_plus_closing_point_accepted():
+    # 200 个不同顶点 + 末尾闭合点 = 201 条原始条目：合法上限，两个接口都受理。
+    region = ngon(200, 100_000, 100_000, 50_000)
+    closed = region + [region[0]]
+    r = post(closed, [{"x": 100_000, "y": 100_000}])
+    assert r.status_code == 200
+    assert r.json()["polygon"]["vertex_count"] == 200
+    assert post_summary(closed).status_code == 200
+
+
+def test_over_limit_pocket_with_closing_point_reports_vertex_limit_and_index():
+    # 超限口袋（201 个不同顶点 + 末尾闭合）：不得报通用"列表过长"，
+    # 必须返回口袋顶点超限并保留口袋序号。
+    big_pocket = [(i, 500 + i * i % 7) for i in range(201)]
+    pockets = [POCKET_A, big_pocket + [big_pocket[0]]]
+    for r in (post_pockets(BIG, [], pockets), post_summary(BIG, pockets=pockets)):
+        assert r.status_code == 422
+        body = r.json()
+        assert set(body) == {"error"}
+        assert body["error"]["code"] == "TOO_MANY_VERTICES"
+        assert body["error"]["details"]["pocket_index"] == 1
+        assert body["error"]["details"]["vertex_count"] == 201
+        assert "results" not in body
+
+
+def test_pocket_200_distinct_plus_closing_point_accepted():
+    # 口袋侧合法上限：200 个不同顶点 + 末尾闭合点 = 201 条原始条目，正常受理。
+    region = [(0, 0), (40000, 0), (40000, 5000), (0, 5000)]
+    pocket = ngon(200, 20000, 2500, 2000)
+    r = post_summary(region, pockets=[pocket + [pocket[0]]])
+    assert r.status_code == 200
+    assert r.json()["pockets"][0]["pocket_index"] == 0
+
+
+def test_eleven_pockets_with_insufficient_vertices_reports_count_first():
+    # 11 个顶点不足的口袋：整单数量限制必须先于逐口袋顶点校验，
+    # 不得返回 11 条局部顶点错误。
+    pockets = [[(10 + k, 10), (20 + k, 10)] for k in range(11)]
+    for r in (post_pockets(BIG, [], pockets), post_summary(BIG, pockets=pockets)):
+        assert r.status_code == 422
+        body = r.json()
+        assert set(body) == {"error"}
+        assert body["error"]["code"] == "TOO_MANY_POCKETS"
+        assert body["error"]["details"]["pocket_count"] == 11
+        assert "issues" not in body["error"].get("details", {})
+        assert "results" not in body
+
+
+def test_pocket_with_too_few_vertices_reports_indexed_geometry_error():
+    # 单个顶点不足的口袋：由几何层给出显式错误并携带口袋序号。
+    for r in (post_pockets(BIG, [], [POCKET_A, [(50, 50), (60, 60)]]),
+              post_summary(BIG, pockets=[POCKET_A, [(50, 50), (60, 60)]])):
+        assert r.status_code == 422
+        body = r.json()
+        assert body["error"]["code"] == "NOT_ENOUGH_DISTINCT_VERTICES"
+        assert body["error"]["details"]["pocket_index"] == 1
